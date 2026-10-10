@@ -1,11 +1,15 @@
 import os
+import sys
+from pathlib import Path
 import pytest
+
 os.environ["DATABASE_URL"]="sqlite:///./test_ipmprs.db"
 from fastapi.testclient import TestClient
-try:
-    from backend.app import main as main_module
-except ModuleNotFoundError:  # supports local tests from the backend folder
-    from app import main as main_module
+
+# Resolve backend/app regardless of whether pytest is invoked from repo root
+# (README CI command) or from the backend folder (developer command).
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from app import main as main_module
 app = main_module.app
 
 @pytest.fixture(autouse=True)
