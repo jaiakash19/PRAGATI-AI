@@ -76,3 +76,8 @@ nav .active,nav button:hover{background:#d9232e;color:#fff}
  .portal-heading h1 span{font-size:9px}
  .portal-heading>p:last-child{font-size:10px}
 }
+
+.casefile-upload{margin-top:14px;padding:14px;border:1px dashed #9eafc3;border-radius:8px;background:#f5f8fb}
+.casefile-upload .upload{margin-top:0;font-weight:750}
+.casefile-upload small{display:block;color:#526879;margin:8px 0 0;line-height:1.6}
+.upload-message{padding:10px 12px;background:#e4f4eb;color:#17663a;border-radius:5px;margin:12px 0;font-size:12px}

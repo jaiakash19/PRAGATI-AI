@@ -5,14 +5,14 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
 
-from fastapi import Depends, FastAPI, File, HTTPException, UploadFile, Request
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi import Depends, FastAPI, File, Form, HTTPException, UploadFile, Request
+from fastapi.responses import FileResponse, StreamingResponse, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from jose import JWTError, jwt
 from passlib.context import CryptContext
 from pydantic import BaseModel, Field
-from sqlalchemy import DateTime, ForeignKey, Integer, String, Text, JSON, create_engine, select, func, text
+from sqlalchemy import DateTime, ForeignKey, Integer, LargeBinary, String, Text, JSON, create_engine, select, func, text, or_
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, relationship, sessionmaker
 
 APP_ENV = os.getenv("APP_ENV", "development").lower()
@@ -43,7 +43,7 @@ class Proposal(Base):
     __tablename__="proposals"; id: Mapped[int]=mapped_column(primary_key=True); reference: Mapped[str]=mapped_column(String(40), unique=True); title: Mapped[str]=mapped_column(String(240)); summary: Mapped[str]=mapped_column(Text); category: Mapped[str]=mapped_column(String(80)); priority: Mapped[str]=mapped_column(String(20), default="Medium"); status: Mapped[str]=mapped_column(String(30), default="Draft"); author_id: Mapped[int]=mapped_column(ForeignKey("users.id")); department_id: Mapped[Optional[int]]=mapped_column(ForeignKey("departments.id")); created_at: Mapped[datetime]=mapped_column(DateTime, default=lambda:datetime.now(timezone.utc)); updated_at: Mapped[datetime]=mapped_column(DateTime, default=lambda:datetime.now(timezone.utc)); decision: Mapped[Optional[str]]=mapped_column(Text, nullable=True); observations: Mapped[Optional[str]]=mapped_column(Text, nullable=True); outcome: Mapped[Optional[str]]=mapped_column(Text, nullable=True)
     documents: Mapped[list["Document"]]=relationship(back_populates="proposal", cascade="all, delete-orphan")
 class Document(Base):
-    __tablename__="documents"; id: Mapped[int]=mapped_column(primary_key=True); proposal_id: Mapped[int]=mapped_column(ForeignKey("proposals.id")); filename: Mapped[str]=mapped_column(String(255)); stored_name: Mapped[str]=mapped_column(String(255)); content_type: Mapped[str]=mapped_column(String(100)); extracted_text: Mapped[str]=mapped_column(Text, default=""); version: Mapped[int]=mapped_column(Integer, default=1); uploaded_at: Mapped[datetime]=mapped_column(DateTime, default=lambda:datetime.now(timezone.utc)); proposal: Mapped[Proposal]=relationship(back_populates="documents")
+    __tablename__="documents"; id: Mapped[int]=mapped_column(primary_key=True); proposal_id: Mapped[int]=mapped_column(ForeignKey("proposals.id")); filename: Mapped[str]=mapped_column(String(255)); stored_name: Mapped[str]=mapped_column(String(255)); content_type: Mapped[str]=mapped_column(String(100)); extracted_text: Mapped[str]=mapped_column(Text, default=""); content_blob: Mapped[Optional[bytes]]=mapped_column(LargeBinary, nullable=True); document_type: Mapped[str]=mapped_column(String(50), default="Supporting Document"); ocr_status: Mapped[str]=mapped_column(String(40), default="not_required"); version: Mapped[int]=mapped_column(Integer, default=1); uploaded_at: Mapped[datetime]=mapped_column(DateTime, default=lambda:datetime.now(timezone.utc)); proposal: Mapped[Proposal]=relationship(back_populates="documents")
 class ProposalEmbedding(Base):
     __tablename__="proposal_embeddings"; id: Mapped[int]=mapped_column(primary_key=True); proposal_id: Mapped[int]=mapped_column(ForeignKey("proposals.id"), unique=True); model: Mapped[str]=mapped_column(String(120)); vector: Mapped[list]=mapped_column(VECTOR_COLUMN); source_hash: Mapped[str]=mapped_column(String(64)); created_at: Mapped[datetime]=mapped_column(DateTime, default=lambda:datetime.now(timezone.utc))
 class Assignment(Base):
@@ -86,6 +86,12 @@ def can_access_proposal(s, u, p):
     """Submitters are confined to their own or explicitly assigned records."""
     if u.role != "Submitter" or u.role == "Admin": return True
     return p.author_id == u.id or bool(s.scalar(select(Assignment.id).where(Assignment.proposal_id==p.id, Assignment.user_id==u.id)))
+def visible_to(u):
+    """SQL predicate for listing proposals visible to a submitter."""
+    if u.role == "Submitter":
+        return or_(Proposal.author_id == u.id, Proposal.id.in_(select(Assignment.proposal_id).where(Assignment.user_id == u.id)))
+    return True
+
 def assignment_allows(s, u, p):
     assignments=list(s.scalars(select(Assignment).where(Assignment.proposal_id==p.id)).all())
     return not assignments or any(a.user_id==u.id for a in assignments)
@@ -105,26 +111,91 @@ def embedding(text):
     except Exception: return None
 def cosine(a,b): return round(100*sum(x*y for x,y in zip(a,b)),1)
 def store_embedding(s, p):
-    source=p.title+" "+p.summary+" "+" ".join(d.extracted_text for d in p.documents)
+    source="\n".join([p.title, p.summary, p.category, p.decision or "", p.observations or "", p.outcome or ""] + [f"Document type: {d.document_type}\nDocument: {d.filename}\n{d.extracted_text}" for d in p.documents]).strip()
     vector=embedding(source)
     if not vector: return False
     digest=hashlib.sha256(source.encode()).hexdigest(); record=s.scalar(select(ProposalEmbedding).where(ProposalEmbedding.proposal_id==p.id))
     if record: record.vector,record.source_hash,record.created_at=vector,digest,datetime.now(timezone.utc)
     else: s.add(ProposalEmbedding(proposal_id=p.id,model="all-MiniLM-L6-v2",vector=vector,source_hash=digest))
     return True
-def extract_text(raw, content_type):
+def extract_document_text(raw, content_type):
+    """Extract text and OCR image-only pages. Returns (text, status)."""
+    ct = (content_type or "").lower().split(";")[0].strip()
     try:
-        if content_type=="text/plain": return raw.decode("utf-8", errors="replace")
-        if content_type=="application/pdf":
-            from pypdf import PdfReader
-            import io
-            return "\n".join(page.extract_text() or "" for page in PdfReader(io.BytesIO(raw)).pages)
-        if "wordprocessingml" in content_type:
+        if ct == "text/plain":
+            value = raw.decode("utf-8", errors="replace").strip()
+            return value, "text_extracted" if value else "no_text_detected"
+        if ct == "application/vnd.openxmlformats-officedocument.wordprocessingml.document":
             from docx import Document as WordDocument
-            import io
-            return "\n".join(x.text for x in WordDocument(io.BytesIO(raw)).paragraphs)
-    except Exception: return ""
-    return ""
+            doc = WordDocument(io.BytesIO(raw))
+            parts = [p.text for p in doc.paragraphs if p.text.strip()]
+            for table in doc.tables:
+                for row in table.rows:
+                    parts.append(" | ".join(cell.text.strip() for cell in row.cells if cell.text.strip()))
+            value = "\n".join(parts).strip()
+            return value, "text_extracted" if value else "no_text_detected"
+        if ct in {"image/jpeg", "image/jpg", "image/png", "image/webp", "image/tiff", "image/bmp"}:
+            try:
+                from PIL import Image, ImageOps
+                import pytesseract
+                with Image.open(io.BytesIO(raw)) as opened:
+                    if opened.width * opened.height > 30_000_000:
+                        return "", "image_dimensions_too_large"
+                    image = ImageOps.exif_transpose(opened).convert("RGB")
+                    image.thumbnail((2400, 2400))
+                    value = pytesseract.image_to_string(image, lang="eng").strip()
+                return value, "ocr_processed" if value else "no_text_detected"
+            except Exception:
+                return "", "ocr_unavailable"
+        if ct == "application/pdf":
+            from pypdf import PdfReader
+            reader = PdfReader(io.BytesIO(raw))
+            pages = []
+            needs_ocr = []
+            for index, page in enumerate(reader.pages):
+                value = (page.extract_text() or "").strip()
+                pages.append(value)
+                if len(value) < 35:
+                    needs_ocr.append(index)
+            attempted = needs_ocr[:30]
+            ocr_failed = False
+            if attempted:
+                try:
+                    import pypdfium2 as pdfium
+                    import pytesseract
+                    pdf = pdfium.PdfDocument(raw)
+                    for index in attempted:
+                        page = pdf[index]
+                        bitmap = page.render(scale=1.5)
+                        image = bitmap.to_pil()
+                        try:
+                            value = pytesseract.image_to_string(image, lang="eng").strip()
+                            if value:
+                                pages[index] = value
+                        finally:
+                            image.close()
+                            bitmap.close()
+                            page.close()
+                    pdf.close()
+                except Exception:
+                    ocr_failed = True
+            combined = "\n\n".join(x for x in pages if x).strip()
+            if ocr_failed and not combined:
+                return "", "ocr_unavailable"
+            if attempted and len(needs_ocr) > len(attempted):
+                return combined, "ocr_partial"
+            if attempted and not ocr_failed:
+                return combined, "ocr_processed" if combined else "no_text_detected"
+            return combined, "text_extracted" if combined else ("ocr_unavailable" if ocr_failed else "no_text_detected")
+    except Exception:
+        return "", "extraction_failed"
+    return "", "unsupported_type"
+
+
+def extract_text(raw, content_type):
+    """Compatibility wrapper returning extracted text only."""
+    return extract_document_text(raw, content_type)[0]
+
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
@@ -164,8 +235,10 @@ def login(body:Login,s:Session=Depends(db)):
 def me(u=Depends(current)): return {"id":u.id,"name":u.name,"email":u.email,"role":u.role}
 @app.get("/dashboard")
 def dashboard(u=Depends(current),s:Session=Depends(db)):
-    total=s.scalar(select(func.count(Proposal.id))) or 0; rows=s.scalars(select(Proposal).order_by(Proposal.updated_at.desc()).limit(6)).all()
-    return {"stats":{"total":total,"pending":s.scalar(select(func.count(Proposal.id)).where(Proposal.status.in_(["Submitted","Under Review","Recommended"]))) or 0,"approved":s.scalar(select(func.count(Proposal.id)).where(Proposal.status.in_(["Approved","Implemented","Closed"]))) or 0,"implemented":s.scalar(select(func.count(Proposal.id)).where(Proposal.status.in_(["Implemented","Closed"]))) or 0},"recent":[proposal_dict(x) for x in rows]}
+    scope = visible_to(u)
+    total=s.scalar(select(func.count(Proposal.id)).where(scope)) or 0
+    rows=s.scalars(select(Proposal).where(scope).order_by(Proposal.updated_at.desc()).limit(6)).all()
+    return {"stats":{"total":total,"pending":s.scalar(select(func.count(Proposal.id)).where(scope,Proposal.status.in_(["Submitted","Under Review","Recommended"]))) or 0,"approved":s.scalar(select(func.count(Proposal.id)).where(scope,Proposal.status.in_(["Approved","Implemented","Closed"]))) or 0,"implemented":s.scalar(select(func.count(Proposal.id)).where(scope,Proposal.status.in_(["Implemented","Closed"]))) or 0},"recent":[proposal_dict(x) for x in rows]}
 @app.get("/proposals")
 def proposals(q:str="",status:str="",u=Depends(current),s:Session=Depends(db)):
     st=select(Proposal).order_by(Proposal.updated_at.desc())
@@ -190,7 +263,7 @@ def get_proposal(pid:int,u=Depends(current),s:Session=Depends(db)):
     p=s.get(Proposal,pid)
     if not p:raise HTTPException(404,"Proposal not found")
     if not can_access_proposal(s,u,p): raise HTTPException(403,"Not authorized for this proposal")
-    r=proposal_dict(p);r["documents"]=[{"id":d.id,"filename":d.filename,"version":d.version,"uploaded_at":d.uploaded_at,"content_type":d.content_type} for d in p.documents];r["reviews"]=[{"action":x.action,"reason":x.reason,"created_at":x.created_at} for x in s.scalars(select(Review).where(Review.proposal_id==pid)).all()]; impl=s.scalar(select(Implementation).where(Implementation.proposal_id==pid));r["implementation"]={"progress":impl.progress,"milestone":impl.milestone,"evidence":impl.evidence,"closed_at":impl.closed_at} if impl else None;r["assignments"]=[{"id":a.id,"user_id":a.user_id,"role":a.role} for a in s.scalars(select(Assignment).where(Assignment.proposal_id==pid)).all()];return r
+    r=proposal_dict(p);r["documents"]=[{"id":d.id,"filename":d.filename,"version":d.version,"uploaded_at":d.uploaded_at,"content_type":d.content_type,"document_type":d.document_type,"ocr_status":d.ocr_status,"extracted_text_length":len(d.extracted_text or "")} for d in p.documents];r["reviews"]=[{"action":x.action,"reason":x.reason,"created_at":x.created_at} for x in s.scalars(select(Review).where(Review.proposal_id==pid)).all()]; impl=s.scalar(select(Implementation).where(Implementation.proposal_id==pid));r["implementation"]={"progress":impl.progress,"milestone":impl.milestone,"evidence":impl.evidence,"closed_at":impl.closed_at} if impl else None;r["assignments"]=[{"id":a.id,"user_id":a.user_id,"role":a.role} for a in s.scalars(select(Assignment).where(Assignment.proposal_id==pid)).all()];return r
 @app.post("/proposals/{pid}/action")
 def action(pid:int,body:ActionIn,u=Depends(current),s:Session=Depends(db)):
     p=s.get(Proposal,pid)
@@ -202,21 +275,21 @@ def action(pid:int,body:ActionIn,u=Depends(current),s:Session=Depends(db)):
     if u.role not in roles:raise HTTPException(403,"Role cannot perform this action")
     if p.status not in states: raise HTTPException(409,f"Cannot {body.action} a proposal in {p.status}")
     if u.role != "Admin" and not assignment_allows(s,u,p): raise HTTPException(403,"Proposal is assigned to another officer")
-    p.status=new;p.decision=body.action.title() if body.action in {"approve","reject"} else p.decision;p.observations=body.reason;p.updated_at=datetime.now(timezone.utc);s.add(Review(proposal_id=pid,reviewer_id=u.id,action=body.action,reason=body.reason)); notify(s,p.author_id,f"{p.reference}: {new}. {body.reason}");audit(s,u,body.action,"proposal",pid,body.reason);s.commit();return proposal_dict(p)
+    p.status=new;p.decision=body.action.title() if body.action in {"approve","reject"} else p.decision;p.observations=body.reason;p.updated_at=datetime.now(timezone.utc);s.add(Review(proposal_id=pid,reviewer_id=u.id,action=body.action,reason=body.reason)); notify(s,p.author_id,f"{p.reference}: {new}. {body.reason}");store_embedding(s,p);audit(s,u,body.action,"proposal",pid,body.reason);s.commit();return proposal_dict(p)
 @app.get("/proposals/{pid}/precedents")
 def precedents(pid:int,u=Depends(current),s:Session=Depends(db)):
     p=s.get(Proposal,pid)
     if not p:raise HTTPException(404,"Proposal not found")
     if not can_access_proposal(s,u,p): raise HTTPException(403,"Not authorized for this proposal")
-    candidates=[x for x in s.scalars(select(Proposal).where(Proposal.id!=pid,Proposal.status.in_(["Approved","Implemented","Closed"]))).all()]; query=p.title+" "+p.summary; qv=embedding(query)
+    candidates=[x for x in s.scalars(select(Proposal).where(Proposal.id!=pid,Proposal.status!="Draft")).all()]; query="\n".join([p.title,p.summary,p.category,p.decision or "",p.observations or "",p.outcome or ""]); qv=embedding(query)
     # pgvector does the ranking in PostgreSQL when model weights are available. Any model/database
     # failure deliberately falls back to deterministic lexical retrieval rather than inventing a score.
     if qv and DATABASE_URL.startswith("postgresql"):
         try:
-            rows=s.execute(select(Proposal,ProposalEmbedding.vector.cosine_distance(qv).label("distance")).join(ProposalEmbedding,ProposalEmbedding.proposal_id==Proposal.id).where(Proposal.id!=pid,Proposal.status.in_(["Approved","Implemented","Closed"])).order_by("distance").limit(5)).all()
-            if rows: return [{**proposal_dict(x),"similarity":round(max(0,100*(1-float(distance))),1),"matched_excerpt":x.summary[:220],"method":"semantic pgvector"} for x,distance in rows]
+            rows=s.execute(select(Proposal,ProposalEmbedding.vector.cosine_distance(qv).label("distance")).join(ProposalEmbedding,ProposalEmbedding.proposal_id==Proposal.id).where(Proposal.id!=pid,Proposal.status!="Draft").order_by("distance").limit(10)).all()
+            if rows: return [{**proposal_dict(x),"similarity":round(max(0,100*(1-float(distance))),1),"matched_excerpt":(x.summary+"\nDecision: "+(x.decision or "Not recorded")+"\nObservations: "+(x.observations or "Not recorded")+"\nOutcome: "+(x.outcome or "Not recorded"))[:420],"method":"semantic pgvector"} for x,distance in rows]
         except Exception: s.rollback()
-    return [{**proposal_dict(x),"similarity":score(query,x),"matched_excerpt":x.summary[:220],"method":"lexical fallback"} for x in sorted(candidates,key=lambda x:score(query,x),reverse=True)[:5]]
+    return [{**proposal_dict(x),"similarity":score(query,x),"matched_excerpt":(x.summary+"\nDecision: "+(x.decision or "Not recorded")+"\nObservations: "+(x.observations or "Not recorded")+"\nOutcome: "+(x.outcome or "Not recorded"))[:420],"method":"lexical fallback"} for x in sorted(candidates,key=lambda x:score(query,x),reverse=True)[:10]]
 @app.post("/proposals/{pid}/implementation")
 def implementation(pid:int,body:ImplementationIn,u=Depends(allow("Implementation Officer","Admin")),s:Session=Depends(db)):
     p=s.get(Proposal,pid)
@@ -226,28 +299,56 @@ def implementation(pid:int,body:ImplementationIn,u=Depends(allow("Implementation
     rec=s.scalar(select(Implementation).where(Implementation.proposal_id==pid)) or Implementation(proposal_id=pid);rec.progress=body.progress;rec.milestone=body.milestone;rec.evidence=body.evidence
     if body.progress==100:rec.closed_at=datetime.now(timezone.utc);p.status="Closed";p.outcome=body.evidence
     else:p.status="Implemented"
-    s.add(rec);audit(s,u,"Updated implementation","proposal",pid);s.commit();return {"progress":rec.progress,"status":p.status}
+    s.add(rec);store_embedding(s,p);audit(s,u,"Updated implementation","proposal",pid);s.commit();return {"progress":rec.progress,"status":p.status}
 @app.post("/proposals/{pid}/documents")
-def upload(pid:int,file:UploadFile=File(...),u=Depends(allow("Admin","Submitter")),s:Session=Depends(db)):
-    if file.content_type not in {"application/pdf","application/vnd.openxmlformats-officedocument.wordprocessingml.document","text/plain"}:raise HTTPException(415,"Only PDF, DOCX and TXT permitted")
+def upload(pid:int,file:UploadFile=File(...),document_type:str=Form("Case File"),u=Depends(allow("Admin","Submitter")),s:Session=Depends(db)):
+    content_type=(file.content_type or "").lower().split(";")[0].strip()
+    extension=Path(file.filename or "").suffix.lower()
+    allowed={
+        ".pdf":{"application/pdf"},
+        ".docx":{"application/vnd.openxmlformats-officedocument.wordprocessingml.document"},
+        ".txt":{"text/plain"},
+        ".jpg":{"image/jpeg","image/jpg"}, ".jpeg":{"image/jpeg","image/jpg"},
+        ".png":{"image/png"}, ".webp":{"image/webp"},
+        ".tif":{"image/tiff"}, ".tiff":{"image/tiff"}, ".bmp":{"image/bmp"},
+    }
+    if extension not in allowed or content_type not in allowed[extension]:
+        raise HTTPException(415,"Allowed types: PDF, DOCX, TXT, JPG/JPEG, PNG, WEBP, TIFF and BMP. Filename extension and MIME type must match.")
+    if document_type not in {"Case File","Supporting Document","Photo/Scan","Evidence Attachment"}: raise HTTPException(422,"Unknown document type.")
     p=s.get(Proposal,pid)
-    if not p:raise HTTPException(404,"Proposal not found")
+    if not p: raise HTTPException(404,"Proposal not found")
     if not can_access_proposal(s,u,p): raise HTTPException(403,"Not authorized for this proposal")
     raw=file.file.read()
-    if len(raw)>10_000_000:raise HTTPException(413,"File too large")
-    name=hashlib.sha256(raw).hexdigest()+Path(file.filename).suffix; (UPLOAD_DIR/name).write_bytes(raw);d=Document(proposal_id=pid,filename=Path(file.filename).name,stored_name=name,content_type=file.content_type,extracted_text=extract_text(raw,file.content_type)) ;s.add(d);s.flush();store_embedding(s,p);audit(s,u,"Uploaded document","document",d.id);s.commit();return {"id":d.id,"filename":d.filename}
+    if not raw: raise HTTPException(400,"The uploaded file is empty.")
+    if len(raw)>10_000_000: raise HTTPException(413,"File too large; maximum is 10 MB.")
+    extracted, extraction_status=extract_document_text(raw,content_type)
+    original_name=Path(file.filename or "case-file").name[:240]
+    stored=hashlib.sha256(raw).hexdigest()+extension
+    try: (UPLOAD_DIR/stored).write_bytes(raw)
+    except OSError: raise HTTPException(500,"The original file could not be persisted.")
+    d=Document(proposal_id=pid,filename=original_name,stored_name=stored,content_type=content_type,extracted_text=extracted,content_blob=raw,document_type=document_type,ocr_status=extraction_status)
+    s.add(d);s.flush();store_embedding(s,p)
+    audit(s,u,"Uploaded and digitized case file","document",d.id,f"type={document_type}; filename={original_name}; extraction={extraction_status}; chars={len(extracted)}")
+    s.commit()
+    return {"id":d.id,"filename":d.filename,"document_type":d.document_type,"extraction_status":extraction_status,"extracted_characters":len(extracted),"saved_in_database":True,"searchable":bool(extracted),"message":("File and extracted text saved. OCR completed." if extraction_status in {"ocr_processed","ocr_partial"} else "File saved, but no searchable text was extracted. Verify OCR status and scan quality." if not extracted else "File and extracted text saved and searchable.")}
+
 @app.get("/documents")
 def documents(q:str="",u=Depends(current),s:Session=Depends(db)):
-    st=select(Document,Proposal).join(Proposal,Document.proposal_id==Proposal.id).order_by(Document.uploaded_at.desc())
+    st=select(Document,Proposal).join(Proposal,Document.proposal_id==Proposal.id).where(visible_to(u)).order_by(Document.uploaded_at.desc())
     if q: st=st.where(Document.filename.ilike(f"%{q}%") | Proposal.reference.ilike(f"%{q}%") | Document.extracted_text.ilike(f"%{q}%"))
-    return [{"id":d.id,"filename":d.filename,"reference":p.reference,"proposal_title":p.title,"version":d.version,"uploaded_at":d.uploaded_at,"content_type":d.content_type} for d,p in s.execute(st).all()]
+    return [{"id":d.id,"filename":d.filename,"document_type":d.document_type,"ocr_status":d.ocr_status,"extracted_text_length":len(d.extracted_text or ""),"reference":p.reference,"proposal_title":p.title,"version":d.version,"uploaded_at":d.uploaded_at,"content_type":d.content_type} for d,p in s.execute(st).all()]
 @app.get("/documents/{did}/download")
 def download(did:int,u=Depends(current),s:Session=Depends(db)):
     d=s.get(Document,did)
-    if not d or not (UPLOAD_DIR/d.stored_name).is_file(): raise HTTPException(404,"Document not found")
+    if not d: raise HTTPException(404,"Document not found")
     p=s.get(Proposal,d.proposal_id)
     if not p or not can_access_proposal(s,u,p): raise HTTPException(403,"Not authorized for this document")
-    audit(s,u,"Downloaded","document",did);s.commit();return FileResponse(UPLOAD_DIR/d.stored_name,media_type=d.content_type,filename=d.filename)
+    audit(s,u,"Downloaded","document",did);s.commit()
+    safe_name=re.sub(r"[^A-Za-z0-9._-]","_",Path(d.filename).name)[:180] or "case-file"
+    if d.content_blob is not None:
+        return Response(content=d.content_blob,media_type=d.content_type,headers={"Content-Disposition":f'attachment; filename="{safe_name}"',"X-Content-Type-Options":"nosniff"})
+    if not (UPLOAD_DIR/d.stored_name).is_file(): raise HTTPException(404,"Stored file is unavailable")
+    return FileResponse(UPLOAD_DIR/d.stored_name,media_type=d.content_type,filename=safe_name)
 @app.post("/proposals/{pid}/assignments")
 def assign(pid:int,body:AssignmentIn,u=Depends(allow("Admin")),s:Session=Depends(db)):
     if not s.get(Proposal,pid) or not s.get(User,body.user_id): raise HTTPException(404,"Proposal or user not found")
@@ -283,7 +384,7 @@ def update_user(uid:int,body:UserIn,u=Depends(allow("Admin")),s:Session=Depends(
 @app.get("/reports/proposals.csv")
 def export_csv(u=Depends(current),s:Session=Depends(db)):
     out=io.StringIO();w=csv.writer(out);w.writerow(["Reference","Title","Category","Priority","Status","Decision","Outcome","Created"])
-    for p in s.scalars(select(Proposal).order_by(Proposal.created_at.desc())).all():w.writerow([p.reference,p.title,p.category,p.priority,p.status,p.decision or "",p.outcome or "",p.created_at.isoformat()])
+    for p in s.scalars(select(Proposal).where(visible_to(u)).order_by(Proposal.created_at.desc())).all():w.writerow([p.reference,p.title,p.category,p.priority,p.status,p.decision or "",p.outcome or "",p.created_at.isoformat()])
     audit(s,u,"Exported","report",0);s.commit();return StreamingResponse(iter([out.getvalue()]),media_type="text/csv",headers={"Content-Disposition":"attachment; filename=ipmprs-proposals.csv"})
 @app.get("/audit")
 def audits(u=Depends(allow("Admin")),s:Session=Depends(db)): return [{"action":x.action,"entity":x.entity,"entity_id":x.entity_id,"details":x.details,"created_at":x.created_at} for x in s.scalars(select(AuditLog).order_by(AuditLog.created_at.desc()).limit(100)).all()]
