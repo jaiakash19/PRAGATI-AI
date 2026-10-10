@@ -89,3 +89,10 @@ For public deployment, add TLS termination, malware scanning/object storage for 
 - Docker installs Tesseract. Local non-Docker setups must install the Tesseract engine separately and install requirements from backend/requirements.txt.
 - Migration 0002_document_blob_and_ocr.py adds database binary storage and OCR metadata to existing installs. Back up the database before schema changes.
 - The API test suite includes an upload, OCR-text-search, database-backed download, and document visibility test; OCR is mocked in tests so a local Tesseract binary is not required.
+
+
+## Precedent Impact & Risk Intelligence
+
+The proposal editor has a pre-submission precedent check, and every proposal detail page shows an evidence brief before review/approval. It compares positive and adverse historical records, flags contradictory precedent, lists recurring concerns from recorded observations/reviews, highlights missing recorded outcomes, and presents checks for the authorised officer. These are transparent heuristic screening cues, not a calibrated risk probability or an automatic approval/rejection decision.
+
+Existing or imported proposals can be batch-indexed by an Admin from Precedent Search using the Reindex historical archive button. It embeds title, summary, category, decision, observations, outcomes and extracted document text. Newly created proposals, workflow decisions and implementation updates also refresh their embedding. If the local Sentence Transformers model cannot be downloaded/loaded, precedent retrieval uses a labelled lexical fallback.

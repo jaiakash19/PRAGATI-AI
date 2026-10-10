@@ -122,8 +122,12 @@ def embedding(text):
         return _embedding_model.encode(text, normalize_embeddings=True).tolist()
     except Exception: return None
 def cosine(a,b): return round(100*sum(x*y for x,y in zip(a,b)),1)
+def proposal_embedding_text(p):
+    """Canonical text representation used consistently for proposal embeddings."""
+    return "\n".join([p.title, p.summary, p.category, p.decision or "", p.observations or "", p.outcome or ""] + [f"Document type: {d.document_type}\nDocument: {d.filename}\n{d.extracted_text}" for d in p.documents]).strip()
+
 def store_embedding(s, p):
-    source="\n".join([p.title, p.summary, p.category, p.decision or "", p.observations or "", p.outcome or ""] + [f"Document type: {d.document_type}\nDocument: {d.filename}\n{d.extracted_text}" for d in p.documents]).strip()
+    source=proposal_embedding_text(p)
     vector=embedding(source)
     if not vector: return False
     digest=hashlib.sha256(source.encode()).hexdigest(); record=s.scalar(select(ProposalEmbedding).where(ProposalEmbedding.proposal_id==p.id))
@@ -404,6 +408,40 @@ def precedents(pid:int,u=Depends(current),s:Session=Depends(db)):
     if not can_access_proposal(s,u,p): raise HTTPException(403,"Not authorized for this proposal")
     query="\n".join([p.title,p.summary,p.category,p.decision or "",p.observations or "",p.outcome or ""])
     return retrieve_precedents(s,query,exclude_id=pid,limit=10)
+@app.post("/admin/reindex-embeddings")
+def reindex_embeddings(u=Depends(allow("Admin")),s:Session=Depends(db)):
+    """Batch-rebuild the historical proposal vector index after imports or model setup."""
+    global _embedding_model
+    proposals=s.scalars(select(Proposal).order_by(Proposal.id)).all()
+    if not proposals:
+        return {"indexed":0,"total":0,"remaining":0,"model":"all-MiniLM-L6-v2","message":"No proposals are available to index."}
+    try:
+        if _embedding_model is None:
+            from sentence_transformers import SentenceTransformer
+            _embedding_model=SentenceTransformer("all-MiniLM-L6-v2")
+        indexed=0
+        batch_size=32
+        for start in range(0,len(proposals),batch_size):
+            batch=proposals[start:start+batch_size]
+            sources=[proposal_embedding_text(p) for p in batch]
+            vectors=_embedding_model.encode(sources,normalize_embeddings=True,batch_size=16)
+            for p,source,vector in zip(batch,sources,vectors):
+                digest=hashlib.sha256(source.encode()).hexdigest()
+                record=s.scalar(select(ProposalEmbedding).where(ProposalEmbedding.proposal_id==p.id))
+                values=vector.tolist() if hasattr(vector,"tolist") else list(vector)
+                if record:
+                    record.vector=values;record.source_hash=digest;record.model="all-MiniLM-L6-v2";record.created_at=datetime.now(timezone.utc)
+                else:
+                    s.add(ProposalEmbedding(proposal_id=p.id,model="all-MiniLM-L6-v2",vector=values,source_hash=digest))
+                indexed+=1
+            s.commit()
+        return {"indexed":indexed,"total":len(proposals),"remaining":max(0,len(proposals)-indexed),
+            "model":"all-MiniLM-L6-v2","dimensions":384,"message":"Historical proposal text, decisions, observations, outcomes and extracted document text have been embedded and indexed."}
+    except Exception as exc:
+        s.rollback()
+        raise HTTPException(503,"Historical indexing could not complete. Ensure the sentence-transformers model can be downloaded/loaded, then retry. Details: "+str(exc)[:240])
+
+
 @app.post("/proposals/{pid}/implementation")
 def implementation(pid:int,body:ImplementationIn,u=Depends(allow("Implementation Officer","Admin")),s:Session=Depends(db)):
     p=s.get(Proposal,pid)

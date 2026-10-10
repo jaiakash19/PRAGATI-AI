@@ -147,3 +147,19 @@ def test_precedent_intelligence_includes_rejected_historical_records():
         assert any(x["id"]==rejected["id"] and x["status"]=="Rejected" for x in data["matches"])
         assert any(x["reference"]==rejected["reference"] for x in data["impact_brief"]["adverse_precedents"])
         assert "not a calibrated risk probability" in data["impact_brief"]["disclaimer"]
+
+
+def test_admin_can_reindex_historical_proposal_archive(monkeypatch):
+    class FakeEmbeddingModel:
+        def encode(self, texts, normalize_embeddings=True, batch_size=16):
+            return [[0.0] * 384 for _ in texts]
+    monkeypatch.setattr(main_module, "_embedding_model", FakeEmbeddingModel())
+    with TestClient(app) as c:
+        login=c.post("/auth/login",json={"email":"admin@ipmprs.demo","password":"Demo@123"})
+        assert login.status_code==200
+        headers={"Authorization":"Bearer "+login.json()["token"]}
+        response=c.post("/admin/reindex-embeddings",headers=headers)
+        assert response.status_code==200, response.text
+        data=response.json()
+        assert data["indexed"] == data["total"]
+        assert data["dimensions"] == 384

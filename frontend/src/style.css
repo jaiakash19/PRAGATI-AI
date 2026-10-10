@@ -97,3 +97,9 @@ nav .active,nav button:hover{background:#d9232e;color:#fff}
 .impact-source{display:grid;gap:4px;padding:10px 0;border-top:1px solid #e6ebf0;font-size:11px}.impact-source span{color:#b12934;font-weight:750}.impact-source small{color:#64798c;font-size:11px;line-height:1.5}
 .impact-disclaimer{font-size:10px;line-height:1.7;border-top:1px solid #e7ecf1;padding-top:10px;margin-top:15px}
 @media(max-width:550px){.impact-kpis{grid-template-columns:repeat(2,minmax(0,1fr))}.impact-heading{flex-direction:column}}
+
+.precedent-head{display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap}
+.precedent-head h3{margin:0}
+.secondary-action{border:1px solid #cbd6df;background:#fff;color:#173f73;border-radius:5px;padding:8px 11px;cursor:pointer;font-weight:700;font-size:12px}
+.secondary-action:hover{background:#edf4fa}
+.secondary-action:disabled{opacity:.55;cursor:wait}
