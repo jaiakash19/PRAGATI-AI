@@ -2,22 +2,41 @@ services:
   db:
     image: pgvector/pgvector:pg16
     environment:
-      POSTGRES_DB: ipmprs
-      POSTGRES_USER: ipmprs
-      POSTGRES_PASSWORD: ipmprs
+      POSTGRES_DB: ${POSTGRES_DB:-ipmprs}
+      POSTGRES_USER: ${POSTGRES_USER:-ipmprs}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
     ports: ["5432:5432"]
     volumes: [postgres_data:/var/lib/postgresql/data]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
   api:
     build: ./backend
     environment:
-      DATABASE_URL: postgresql+psycopg://ipmprs:ipmprs@db:5432/ipmprs
-      SECRET_KEY: change-this-in-production
-      CORS_ORIGINS: http://localhost:5173
+      APP_ENV: production
+      DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-ipmprs}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB:-ipmprs}
+      SECRET_KEY: ${SECRET_KEY:?Set SECRET_KEY in .env}
+      CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:5173}
+      UPLOAD_DIR: /data/uploads
+      DEMO_SEED: ${DEMO_SEED:-false}
     ports: ["8000:8000"]
-    depends_on: [db]
+    volumes: [uploads_data:/data/uploads]
+    depends_on:
+      db:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
   web:
     build: ./frontend
     ports: ["5173:80"]
-    depends_on: [api]
+    depends_on:
+      api:
+        condition: service_healthy
 volumes:
   postgres_data:
+  uploads_data:

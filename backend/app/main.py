@@ -1,21 +1,25 @@
 """IPMPRS API: authenticated proposal workflow and precedent retrieval."""
 import csv, hashlib, io, os, re
+from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
 
-from fastapi import Depends, FastAPI, File, HTTPException, UploadFile
+from fastapi import Depends, FastAPI, File, HTTPException, UploadFile, Request
 from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from jose import JWTError, jwt
 from passlib.context import CryptContext
 from pydantic import BaseModel, Field
-from sqlalchemy import DateTime, ForeignKey, Integer, String, Text, JSON, create_engine, select, func
+from sqlalchemy import DateTime, ForeignKey, Integer, String, Text, JSON, create_engine, select, func, text
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, relationship, sessionmaker
 
-DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./ipmprs.db")
+APP_ENV = os.getenv("APP_ENV", "development").lower()
+DATABASE_URL = os.getenv("DATABASE_URL") or ("sqlite:///./ipmprs.db" if APP_ENV != "production" else "")
 SECRET_KEY = os.getenv("SECRET_KEY", "development-secret-change-me")
+if not DATABASE_URL: raise RuntimeError("DATABASE_URL is required in production")
+if APP_ENV == "production" and (SECRET_KEY == "development-secret-change-me" or len(SECRET_KEY) < 32): raise RuntimeError("Set a strong SECRET_KEY in production")
 UPLOAD_DIR = Path(os.getenv("UPLOAD_DIR", "uploads")); UPLOAD_DIR.mkdir(exist_ok=True)
 engine = create_engine(DATABASE_URL, future=True)
 SessionLocal = sessionmaker(engine, expire_on_commit=False)
@@ -24,6 +28,11 @@ pwd = CryptContext(schemes=["pbkdf2_sha256"], deprecated="auto")
 security = HTTPBearer()
 ROLES = {"Admin", "Submitter", "Reviewer", "Approving Officer", "Implementation Officer"}
 _embedding_model = None
+try:
+    from pgvector.sqlalchemy import Vector
+    VECTOR_COLUMN = Vector(384).with_variant(JSON(), "sqlite")
+except ImportError:
+    VECTOR_COLUMN = JSON()
 
 class Base(DeclarativeBase): pass
 class Department(Base):
@@ -36,7 +45,7 @@ class Proposal(Base):
 class Document(Base):
     __tablename__="documents"; id: Mapped[int]=mapped_column(primary_key=True); proposal_id: Mapped[int]=mapped_column(ForeignKey("proposals.id")); filename: Mapped[str]=mapped_column(String(255)); stored_name: Mapped[str]=mapped_column(String(255)); content_type: Mapped[str]=mapped_column(String(100)); extracted_text: Mapped[str]=mapped_column(Text, default=""); version: Mapped[int]=mapped_column(Integer, default=1); uploaded_at: Mapped[datetime]=mapped_column(DateTime, default=lambda:datetime.now(timezone.utc)); proposal: Mapped[Proposal]=relationship(back_populates="documents")
 class ProposalEmbedding(Base):
-    __tablename__="proposal_embeddings"; id: Mapped[int]=mapped_column(primary_key=True); proposal_id: Mapped[int]=mapped_column(ForeignKey("proposals.id"), unique=True); model: Mapped[str]=mapped_column(String(120)); vector: Mapped[list]=mapped_column(JSON); source_hash: Mapped[str]=mapped_column(String(64)); created_at: Mapped[datetime]=mapped_column(DateTime, default=lambda:datetime.now(timezone.utc))
+    __tablename__="proposal_embeddings"; id: Mapped[int]=mapped_column(primary_key=True); proposal_id: Mapped[int]=mapped_column(ForeignKey("proposals.id"), unique=True); model: Mapped[str]=mapped_column(String(120)); vector: Mapped[list]=mapped_column(VECTOR_COLUMN); source_hash: Mapped[str]=mapped_column(String(64)); created_at: Mapped[datetime]=mapped_column(DateTime, default=lambda:datetime.now(timezone.utc))
 class Assignment(Base):
     __tablename__="assignments"; id: Mapped[int]=mapped_column(primary_key=True); proposal_id: Mapped[int]=mapped_column(ForeignKey("proposals.id")); user_id: Mapped[int]=mapped_column(ForeignKey("users.id")); role: Mapped[str]=mapped_column(String(50))
 class Review(Base):
@@ -73,6 +82,13 @@ def allow(*roles):
         if u.role not in roles: raise HTTPException(403,"Insufficient permission")
         return u
     return check
+def can_access_proposal(s, u, p):
+    """Submitters are confined to their own or explicitly assigned records."""
+    if u.role != "Submitter" or u.role == "Admin": return True
+    return p.author_id == u.id or bool(s.scalar(select(Assignment.id).where(Assignment.proposal_id==p.id, Assignment.user_id==u.id)))
+def assignment_allows(s, u, p):
+    assignments=list(s.scalars(select(Assignment).where(Assignment.proposal_id==p.id)).all())
+    return not assignments or any(a.user_id==u.id for a in assignments)
 def proposal_dict(p): return {"id":p.id,"reference":p.reference,"title":p.title,"summary":p.summary,"category":p.category,"priority":p.priority,"status":p.status,"created_at":p.created_at,"decision":p.decision,"observations":p.observations,"outcome":p.outcome}
 def user_dict(x): return {"id":x.id,"name":x.name,"email":x.email,"role":x.role,"department_id":x.department_id,"active":x.active}
 def words(t): return set(re.findall(r"[a-z]{3,}",t.lower()))
@@ -88,6 +104,14 @@ def embedding(text):
         return _embedding_model.encode(text, normalize_embeddings=True).tolist()
     except Exception: return None
 def cosine(a,b): return round(100*sum(x*y for x,y in zip(a,b)),1)
+def store_embedding(s, p):
+    source=p.title+" "+p.summary+" "+" ".join(d.extracted_text for d in p.documents)
+    vector=embedding(source)
+    if not vector: return False
+    digest=hashlib.sha256(source.encode()).hexdigest(); record=s.scalar(select(ProposalEmbedding).where(ProposalEmbedding.proposal_id==p.id))
+    if record: record.vector,record.source_hash,record.created_at=vector,digest,datetime.now(timezone.utc)
+    else: s.add(ProposalEmbedding(proposal_id=p.id,model="all-MiniLM-L6-v2",vector=vector,source_hash=digest))
+    return True
 def extract_text(raw, content_type):
     try:
         if content_type=="text/plain": return raw.decode("utf-8", errors="replace")
@@ -102,13 +126,26 @@ def extract_text(raw, content_type):
     except Exception: return ""
     return ""
 
-app=FastAPI(title="IPMPRS")
-app.add_middleware(CORSMiddleware,allow_origins=os.getenv("CORS_ORIGINS","http://localhost:5173").split(","),allow_credentials=True,allow_methods=["*"],allow_headers=["*"])
-@app.on_event("startup")
-def start():
-    Base.metadata.create_all(engine)
+@asynccontextmanager
+async def lifespan(_: FastAPI):
+    """Development/test schema bootstrap; production is migrated by Alembic."""
+    if APP_ENV != "production": Base.metadata.create_all(engine)
     with SessionLocal() as s:
-        if not s.scalar(select(User.id).limit(1)): seed(s)
+        if (APP_ENV != "production" or os.getenv("DEMO_SEED", "false").lower() == "true") and not s.scalar(select(User.id).limit(1)): seed(s)
+    yield
+
+allowed_origins=os.getenv("CORS_ORIGINS","http://localhost:5173").split(",")
+if APP_ENV == "production" and "*" in allowed_origins: raise RuntimeError("Wildcard CORS is forbidden in production")
+app=FastAPI(title="IPMPRS", lifespan=lifespan, docs_url="/docs" if APP_ENV != "production" else None, redoc_url=None)
+app.add_middleware(CORSMiddleware,allow_origins=allowed_origins,allow_credentials=True,allow_methods=["GET","POST","PUT"],allow_headers=["Authorization","Content-Type"])
+@app.middleware("http")
+async def security_headers(request: Request, call_next):
+    response=await call_next(request)
+    response.headers["X-Content-Type-Options"]="nosniff";response.headers["X-Frame-Options"]="DENY";response.headers["Referrer-Policy"]="no-referrer"
+    return response
+@app.get("/health")
+def health(s:Session=Depends(db)):
+    s.execute(text("SELECT 1")); return {"status":"ok","environment":APP_ENV,"database":"postgresql" if DATABASE_URL.startswith("postgresql") else "sqlite"}
 def seed(s):
     d=Department(name="Police Modernisation Directorate"); s.add(d); s.flush()
     users=[("System Administrator","admin@ipmprs.demo","Admin"),("Asha Verma","submitter@ipmprs.demo","Submitter"),("Rahul Singh","reviewer@ipmprs.demo","Reviewer"),("Maya Nair","approver@ipmprs.demo","Approving Officer"),("Vikram Rao","implementation@ipmprs.demo","Implementation Officer")]
@@ -132,13 +169,13 @@ def dashboard(u=Depends(current),s:Session=Depends(db)):
 @app.get("/proposals")
 def proposals(q:str="",status:str="",u=Depends(current),s:Session=Depends(db)):
     st=select(Proposal).order_by(Proposal.updated_at.desc())
+    if u.role == "Submitter": st=st.where((Proposal.author_id==u.id) | Proposal.id.in_(select(Assignment.proposal_id).where(Assignment.user_id==u.id)))
     if q: st=st.where(Proposal.title.ilike(f"%{q}%") | Proposal.reference.ilike(f"%{q}%"))
     if status: st=st.where(Proposal.status==status)
     return [proposal_dict(x) for x in s.scalars(st).all()]
 @app.post("/proposals")
 def create(body:ProposalIn,u=Depends(allow("Admin","Submitter")),s:Session=Depends(db)):
-    p=Proposal(reference=f"IPM-{datetime.now().year}-{(s.scalar(select(func.count(Proposal.id))) or 0)+1:03d}",author_id=u.id,**body.model_dump());s.add(p);s.flush();v=embedding(p.title+" "+p.summary)
-    if v:s.add(ProposalEmbedding(proposal_id=p.id,model="all-MiniLM-L6-v2",vector=v,source_hash=hashlib.sha256((p.title+p.summary).encode()).hexdigest()))
+    p=Proposal(reference=f"IPM-{datetime.now().year}-{(s.scalar(select(func.count(Proposal.id))) or 0)+1:03d}",author_id=u.id,**body.model_dump());s.add(p);s.flush();store_embedding(s,p)
     audit(s,u,"Created","proposal",p.id);s.commit();return proposal_dict(p)
 @app.put("/proposals/{pid}")
 def update_proposal(pid:int,body:ProposalUpdate,u=Depends(current),s:Session=Depends(db)):
@@ -152,28 +189,40 @@ def update_proposal(pid:int,body:ProposalUpdate,u=Depends(current),s:Session=Dep
 def get_proposal(pid:int,u=Depends(current),s:Session=Depends(db)):
     p=s.get(Proposal,pid)
     if not p:raise HTTPException(404,"Proposal not found")
+    if not can_access_proposal(s,u,p): raise HTTPException(403,"Not authorized for this proposal")
     r=proposal_dict(p);r["documents"]=[{"id":d.id,"filename":d.filename,"version":d.version,"uploaded_at":d.uploaded_at,"content_type":d.content_type} for d in p.documents];r["reviews"]=[{"action":x.action,"reason":x.reason,"created_at":x.created_at} for x in s.scalars(select(Review).where(Review.proposal_id==pid)).all()]; impl=s.scalar(select(Implementation).where(Implementation.proposal_id==pid));r["implementation"]={"progress":impl.progress,"milestone":impl.milestone,"evidence":impl.evidence,"closed_at":impl.closed_at} if impl else None;r["assignments"]=[{"id":a.id,"user_id":a.user_id,"role":a.role} for a in s.scalars(select(Assignment).where(Assignment.proposal_id==pid)).all()];return r
 @app.post("/proposals/{pid}/action")
 def action(pid:int,body:ActionIn,u=Depends(current),s:Session=Depends(db)):
     p=s.get(Proposal,pid)
     if not p:raise HTTPException(404,"Proposal not found")
-    transition={"submit":("Submitted",{"Submitter","Admin"}),"review":("Under Review",{"Reviewer","Admin"}),"modifications":("Modifications Requested",{"Reviewer","Admin"}),"recommend":("Recommended",{"Reviewer","Admin"}),"approve":("Approved",{"Approving Officer","Admin"}),"reject":("Rejected",{"Approving Officer","Admin"})}
+    if not can_access_proposal(s,u,p): raise HTTPException(403,"Not authorized for this proposal")
+    transition={"submit":("Submitted",{"Submitter","Admin"},{"Draft","Modifications Requested"}),"review":("Under Review",{"Reviewer","Admin"},{"Submitted"}),"modifications":("Modifications Requested",{"Reviewer","Admin"},{"Submitted","Under Review"}),"recommend":("Recommended",{"Reviewer","Admin"},{"Under Review"}),"approve":("Approved",{"Approving Officer","Admin"},{"Recommended"}),"reject":("Rejected",{"Approving Officer","Admin"},{"Recommended"})}
     if body.action not in transition:raise HTTPException(422,"Unknown action")
-    new,roles=transition[body.action]
+    new,roles,states=transition[body.action]
     if u.role not in roles:raise HTTPException(403,"Role cannot perform this action")
+    if p.status not in states: raise HTTPException(409,f"Cannot {body.action} a proposal in {p.status}")
+    if u.role != "Admin" and not assignment_allows(s,u,p): raise HTTPException(403,"Proposal is assigned to another officer")
     p.status=new;p.decision=body.action.title() if body.action in {"approve","reject"} else p.decision;p.observations=body.reason;p.updated_at=datetime.now(timezone.utc);s.add(Review(proposal_id=pid,reviewer_id=u.id,action=body.action,reason=body.reason)); notify(s,p.author_id,f"{p.reference}: {new}. {body.reason}");audit(s,u,body.action,"proposal",pid,body.reason);s.commit();return proposal_dict(p)
 @app.get("/proposals/{pid}/precedents")
 def precedents(pid:int,u=Depends(current),s:Session=Depends(db)):
     p=s.get(Proposal,pid)
     if not p:raise HTTPException(404,"Proposal not found")
-    candidates=[x for x in s.scalars(select(Proposal).where(Proposal.id!=pid,Proposal.status.in_(["Approved","Implemented","Closed"]))).all()]; query=p.title+" "+p.summary; qv=embedding(query); stored={e.proposal_id:e.vector for e in s.scalars(select(ProposalEmbedding)).all()}
-    def relevance(x): return cosine(qv,stored[x.id]) if qv and x.id in stored else score(query,x)
-    method="semantic embedding" if qv and any(x.id in stored for x in candidates) else "lexical fallback"
-    return [{**proposal_dict(x),"similarity":relevance(x),"matched_excerpt":x.summary[:220],"method":method} for x in sorted(candidates,key=relevance,reverse=True)[:5]]
+    if not can_access_proposal(s,u,p): raise HTTPException(403,"Not authorized for this proposal")
+    candidates=[x for x in s.scalars(select(Proposal).where(Proposal.id!=pid,Proposal.status.in_(["Approved","Implemented","Closed"]))).all()]; query=p.title+" "+p.summary; qv=embedding(query)
+    # pgvector does the ranking in PostgreSQL when model weights are available. Any model/database
+    # failure deliberately falls back to deterministic lexical retrieval rather than inventing a score.
+    if qv and DATABASE_URL.startswith("postgresql"):
+        try:
+            rows=s.execute(select(Proposal,ProposalEmbedding.vector.cosine_distance(qv).label("distance")).join(ProposalEmbedding,ProposalEmbedding.proposal_id==Proposal.id).where(Proposal.id!=pid,Proposal.status.in_(["Approved","Implemented","Closed"])).order_by("distance").limit(5)).all()
+            return [{**proposal_dict(x),"similarity":round(max(0,100*(1-float(distance))),1),"matched_excerpt":x.summary[:220],"method":"semantic pgvector"} for x,distance in rows]
+        except Exception: s.rollback()
+    return [{**proposal_dict(x),"similarity":score(query,x),"matched_excerpt":x.summary[:220],"method":"lexical fallback"} for x in sorted(candidates,key=lambda x:score(query,x),reverse=True)[:5]]
 @app.post("/proposals/{pid}/implementation")
 def implementation(pid:int,body:ImplementationIn,u=Depends(allow("Implementation Officer","Admin")),s:Session=Depends(db)):
     p=s.get(Proposal,pid)
     if not p:raise HTTPException(404,"Proposal not found")
+    if p.status not in {"Approved","Implemented"}: raise HTTPException(409,"Implementation requires an approved proposal")
+    if u.role != "Admin" and not assignment_allows(s,u,p): raise HTTPException(403,"Proposal is assigned to another officer")
     rec=s.scalar(select(Implementation).where(Implementation.proposal_id==pid)) or Implementation(proposal_id=pid);rec.progress=body.progress;rec.milestone=body.milestone;rec.evidence=body.evidence
     if body.progress==100:rec.closed_at=datetime.now(timezone.utc);p.status="Closed";p.outcome=body.evidence
     else:p.status="Implemented"
@@ -181,10 +230,12 @@ def implementation(pid:int,body:ImplementationIn,u=Depends(allow("Implementation
 @app.post("/proposals/{pid}/documents")
 def upload(pid:int,file:UploadFile=File(...),u=Depends(allow("Admin","Submitter")),s:Session=Depends(db)):
     if file.content_type not in {"application/pdf","application/vnd.openxmlformats-officedocument.wordprocessingml.document","text/plain"}:raise HTTPException(415,"Only PDF, DOCX and TXT permitted")
-    if not s.get(Proposal,pid):raise HTTPException(404,"Proposal not found")
+    p=s.get(Proposal,pid)
+    if not p:raise HTTPException(404,"Proposal not found")
+    if not can_access_proposal(s,u,p): raise HTTPException(403,"Not authorized for this proposal")
     raw=file.file.read()
     if len(raw)>10_000_000:raise HTTPException(413,"File too large")
-    name=hashlib.sha256(raw).hexdigest()+Path(file.filename).suffix; (UPLOAD_DIR/name).write_bytes(raw);d=Document(proposal_id=pid,filename=Path(file.filename).name,stored_name=name,content_type=file.content_type,extracted_text=extract_text(raw,file.content_type)) ;s.add(d);s.flush();audit(s,u,"Uploaded document","document",d.id);s.commit();return {"id":d.id,"filename":d.filename}
+    name=hashlib.sha256(raw).hexdigest()+Path(file.filename).suffix; (UPLOAD_DIR/name).write_bytes(raw);d=Document(proposal_id=pid,filename=Path(file.filename).name,stored_name=name,content_type=file.content_type,extracted_text=extract_text(raw,file.content_type)) ;s.add(d);s.flush();store_embedding(s,p);audit(s,u,"Uploaded document","document",d.id);s.commit();return {"id":d.id,"filename":d.filename}
 @app.get("/documents")
 def documents(q:str="",u=Depends(current),s:Session=Depends(db)):
     st=select(Document,Proposal).join(Proposal,Document.proposal_id==Proposal.id).order_by(Document.uploaded_at.desc())
@@ -194,6 +245,8 @@ def documents(q:str="",u=Depends(current),s:Session=Depends(db)):
 def download(did:int,u=Depends(current),s:Session=Depends(db)):
     d=s.get(Document,did)
     if not d or not (UPLOAD_DIR/d.stored_name).is_file(): raise HTTPException(404,"Document not found")
+    p=s.get(Proposal,d.proposal_id)
+    if not p or not can_access_proposal(s,u,p): raise HTTPException(403,"Not authorized for this document")
     audit(s,u,"Downloaded","document",did);s.commit();return FileResponse(UPLOAD_DIR/d.stored_name,media_type=d.content_type,filename=d.filename)
 @app.post("/proposals/{pid}/assignments")
 def assign(pid:int,body:AssignmentIn,u=Depends(allow("Admin")),s:Session=Depends(db)):
