@@ -159,7 +159,7 @@ def extract_document_text(raw, content_type):
                         return "", "image_dimensions_too_large"
                     image = ImageOps.exif_transpose(opened).convert("RGB")
                     image.thumbnail((2400, 2400))
-                    value = pytesseract.image_to_string(image, lang="eng").strip()
+                    value = pytesseract.image_to_string(image, lang="eng+tam").strip()
                 return value, "ocr_processed" if value else "no_text_detected"
             except Exception:
                 return "", "ocr_unavailable"
@@ -185,7 +185,7 @@ def extract_document_text(raw, content_type):
                         bitmap = page.render(scale=1.5)
                         image = bitmap.to_pil()
                         try:
-                            value = pytesseract.image_to_string(image, lang="eng").strip()
+                            value = pytesseract.image_to_string(image, lang="eng+tam").strip()
                             if value:
                                 pages[index] = value
                         finally:

@@ -84,7 +84,7 @@ For public deployment, add TLS termination, malware scanning/object storage for 
 - Attach PDF, DOCX, TXT, or photo/scan formats JPG/JPEG, PNG, WEBP, TIFF and BMP from a proposal. Upload limit is 10 MB.
 - The original file bytes are stored in the database in the documents.content_blob field and also persisted in the uploads volume for compatibility and recovery. The database stores document type, extracted text, OCR status and metadata; uploads are linked to the proposal and audited.
 - Search the document repository by filename, proposal reference or OCR-extracted text. Downloads return the exact original bytes from the database when available.
-- Selectable PDF/DOCX/TXT text is extracted directly. Images and scanned PDF pages are processed with Tesseract OCR in English. OCR is attempted on PDF pages with little/no selectable text, up to 30 pages per upload. Make sure scans are upright and readable.
+- Selectable PDF/DOCX/TXT text is extracted directly. Images and scanned PDF pages are processed with Tesseract OCR using English and Tamil language data. If your local non-Docker installation supports only English, install the Tesseract Tamil language pack too. OCR is attempted on PDF pages with little/no selectable text, up to 30 pages per upload. Make sure scans are upright and readable.
 - OCR is an indexing aid, not certified transcription. Officers must verify extracted text against the original image before relying on it.
 - Docker installs Tesseract. Local non-Docker setups must install the Tesseract engine separately and install requirements from backend/requirements.txt.
 - Migration 0002_document_blob_and_ocr.py adds database binary storage and OCR metadata to existing installs. Back up the database before schema changes.

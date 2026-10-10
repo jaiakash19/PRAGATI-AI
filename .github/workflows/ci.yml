@@ -35,7 +35,7 @@ jobs:
       - name: Install Tesseract OCR
         run: |
           sudo apt-get update
-          sudo apt-get install -y tesseract-ocr tesseract-ocr-eng
+          sudo apt-get install -y tesseract-ocr tesseract-ocr-eng tesseract-ocr-tam
       - name: Install CPU PyTorch
         run: pip install --index-url https://download.pytorch.org/whl/cpu torch==2.5.1
       - name: Install backend dependencies
