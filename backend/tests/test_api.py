@@ -111,3 +111,35 @@ def test_submitter_cannot_list_another_submitters_documents():
         outsider = auth("second-submitter@ipmprs.demo")
         assert c.get("/documents",headers=outsider,params={"q":"case"}).json() == []
         assert c.get(f"/proposals/{proposal['id']}",headers=outsider).status_code == 403
+
+
+def test_precedent_intelligence_includes_rejected_historical_records():
+    with TestClient(app) as c:
+        def auth(email):
+            response=c.post("/auth/login",json={"email":email,"password":"Demo@123"})
+            assert response.status_code==200
+            return {"Authorization":"Bearer "+response.json()["token"]}
+        submitter=auth("submitter@ipmprs.demo")
+        reviewer=auth("reviewer@ipmprs.demo")
+        approver=auth("approver@ipmprs.demo")
+        old=c.post("/proposals",headers=submitter,json={
+            "title":"Digital evidence camera procurement pilot",
+            "summary":"A pilot to procure digital evidence cameras for patrol units and record chain of custody.",
+            "category":"Technology","priority":"High"
+        })
+        assert old.status_code==200
+        rejected=old.json()
+        assert c.post(f"/proposals/{rejected['id']}/action",headers=submitter,json={"action":"submit","reason":"Submit for review."}).status_code==200
+        assert c.post(f"/proposals/{rejected['id']}/action",headers=reviewer,json={"action":"review","reason":"Assess feasibility."}).status_code==200
+        assert c.post(f"/proposals/{rejected['id']}/action",headers=reviewer,json={"action":"recommend","reason":"Recommend for decision."}).status_code==200
+        assert c.post(f"/proposals/{rejected['id']}/action",headers=approver,json={"action":"reject","reason":"Prior pilot lacked budget and privacy controls."}).status_code==200
+        preview=c.post("/precedents/preview",headers=submitter,json={
+            "title":"Digital evidence camera procurement pilot phase two",
+            "summary":"Procure evidence cameras for patrol teams and include budget and privacy controls.",
+            "category":"Technology","priority":"High"
+        })
+        assert preview.status_code==200, preview.text
+        data=preview.json()
+        assert any(x["id"]==rejected["id"] and x["status"]=="Rejected" for x in data["matches"])
+        assert any(x["reference"]==rejected["reference"] for x in data["impact_brief"]["adverse_precedents"])
+        assert "not a calibrated risk probability" in data["impact_brief"]["disclaimer"]

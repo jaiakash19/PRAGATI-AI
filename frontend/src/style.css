@@ -81,3 +81,19 @@ nav .active,nav button:hover{background:#d9232e;color:#fff}
 .casefile-upload .upload{margin-top:0;font-weight:750}
 .casefile-upload small{display:block;color:#526879;margin:8px 0 0;line-height:1.6}
 .upload-message{padding:10px 12px;background:#e4f4eb;color:#17663a;border-radius:5px;margin:12px 0;font-size:12px}
+
+.impact-preview,.impact-brief{margin-top:18px;border-top:3px solid #d9232e}
+.impact-heading{display:flex;justify-content:space-between;align-items:flex-start;gap:14px;margin-bottom:8px}
+.impact-heading h3{margin-bottom:6px}
+.impact-preview .primary{margin-top:7px}
+.impact-results{margin-top:16px}
+.signal-pill{display:inline-flex;align-items:center;padding:6px 10px;border-radius:20px;font-size:11px;font-weight:800;background:#edf1f6;color:#4c6177;white-space:nowrap}
+.signal-pill.elevated{background:#fdebed;color:#ad2431}.signal-pill.review{background:#fff1d8;color:#925d0b}.signal-pill.neutral{background:#e7f6ef;color:#17663a}
+.impact-kpis{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:9px;margin:15px 0}
+.impact-kpis>div{border:1px solid #e3eaf0;border-radius:7px;background:#f7f9fc;padding:12px}
+.impact-kpis strong{display:block;font-size:22px;color:#102346}.impact-kpis small{display:block;color:#6a7d8e;font-size:10px;line-height:1.4}
+.impact-subsection{margin-top:17px}.impact-subsection h4{margin:0 0 8px;color:#193858}.impact-subsection ul{padding-left:20px;line-height:1.7;color:#44596c;font-size:12px}
+.concern-tags{display:flex;flex-wrap:wrap;gap:7px}.concern-tags span{padding:4px 8px;border:1px solid #ead4aa;border-radius:4px;color:#78551c;background:#fff7e7;font-size:10px;font-weight:750;text-transform:capitalize}
+.impact-source{display:grid;gap:4px;padding:10px 0;border-top:1px solid #e6ebf0;font-size:11px}.impact-source span{color:#b12934;font-weight:750}.impact-source small{color:#64798c;font-size:11px;line-height:1.5}
+.impact-disclaimer{font-size:10px;line-height:1.7;border-top:1px solid #e7ecf1;padding-top:10px;margin-top:15px}
+@media(max-width:550px){.impact-kpis{grid-template-columns:repeat(2,minmax(0,1fr))}.impact-heading{flex-direction:column}}

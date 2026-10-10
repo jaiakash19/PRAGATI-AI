@@ -64,6 +64,11 @@ class ImplementationIn(BaseModel): progress:int=Field(ge=0,le=100); milestone:st
 class UserIn(BaseModel): name:str=Field(min_length=2,max_length=120); email:str; role:str; password:Optional[str]=Field(default=None,min_length=8); department_id:Optional[int]=None; active:bool=True
 class ProposalUpdate(BaseModel): title:str=Field(min_length=3,max_length=240); summary:str=Field(min_length=10); category:str; priority:str; department_id:Optional[int]=None
 class AssignmentIn(BaseModel): user_id:int; role:str=Field(min_length=2,max_length=50)
+class PrecedentPreviewIn(BaseModel):
+    title:str=Field(min_length=3,max_length=240)
+    summary:str=Field(min_length=10,max_length=10000)
+    category:str=Field(min_length=2,max_length=80)
+    priority:str="Medium"
 
 def db():
     with SessionLocal() as s: yield s
@@ -283,20 +288,122 @@ def action(pid:int,body:ActionIn,u=Depends(current),s:Session=Depends(db)):
     if p.status not in states: raise HTTPException(409,f"Cannot {body.action} a proposal in {p.status}")
     if u.role != "Admin" and not assignment_allows(s,u,p): raise HTTPException(403,"Proposal is assigned to another officer")
     p.status=new;p.decision=body.action.title() if body.action in {"approve","reject"} else p.decision;p.observations=body.reason;p.updated_at=datetime.now(timezone.utc);s.add(Review(proposal_id=pid,reviewer_id=u.id,action=body.action,reason=body.reason)); notify(s,p.author_id,f"{p.reference}: {new}. {body.reason}");store_embedding(s,p);audit(s,u,body.action,"proposal",pid,body.reason);s.commit();return proposal_dict(p)
+def retrieve_precedents(s:Session, query:str, exclude_id:Optional[int]=None, limit:int=10):
+    """Retrieve institutionally relevant historical records; never silently discard rejected/modified cases."""
+    filters=[Proposal.status!="Draft"]
+    if exclude_id is not None: filters.append(Proposal.id!=exclude_id)
+    candidates=s.scalars(select(Proposal).where(*filters)).all()
+    qv=embedding(query)
+    if qv and DATABASE_URL.startswith("postgresql"):
+        try:
+            rows=s.execute(
+                select(Proposal,ProposalEmbedding.vector.cosine_distance(qv).label("distance"))
+                .join(ProposalEmbedding,ProposalEmbedding.proposal_id==Proposal.id)
+                .where(*filters).order_by("distance").limit(limit)
+            ).all()
+            if rows:
+                items=[]
+                for proposal,distance in rows:
+                    department=s.get(Department,proposal.department_id) if proposal.department_id else None
+                    excerpt=(proposal.summary+"\nDecision: "+(proposal.decision or "Not recorded")
+                        +"\nObservations: "+(proposal.observations or "Not recorded")
+                        +"\nOutcome: "+(proposal.outcome or "Not recorded"))
+                    items.append({**proposal_dict(proposal),"department_name":department.name if department else "Unspecified",
+                        "similarity":round(max(0,100*(1-float(distance))),1),"matched_excerpt":excerpt[:520],
+                        "method":"semantic pgvector"})
+                return items
+        except Exception:
+            s.rollback()
+    items=[]
+    for proposal in sorted(candidates,key=lambda item:score(query,item),reverse=True)[:limit]:
+        department=s.get(Department,proposal.department_id) if proposal.department_id else None
+        excerpt=(proposal.summary+"\nDecision: "+(proposal.decision or "Not recorded")
+            +"\nObservations: "+(proposal.observations or "Not recorded")
+            +"\nOutcome: "+(proposal.outcome or "Not recorded"))
+        items.append({**proposal_dict(proposal),"department_name":department.name if department else "Unspecified",
+            "similarity":score(query,proposal),"matched_excerpt":excerpt[:520],"method":"lexical fallback"})
+    return items
+
+
+def build_impact_brief(s:Session, matches:list):
+    """Transparent screening cues, not a calibrated probability or an automated decision."""
+    semantic=bool(matches and matches[0].get("method")=="semantic pgvector")
+    threshold=50 if semantic else 5
+    relevant=[m for m in matches if float(m.get("similarity") or 0)>=threshold]
+    adverse_statuses={"Rejected","Modifications Requested","Returned"}
+    positive_statuses={"Approved","Implemented","Closed"}
+    adverse=[m for m in relevant if m.get("status") in adverse_statuses or str(m.get("decision") or "").lower().startswith("reject")]
+    positive=[m for m in relevant if m.get("status") in positive_statuses and not str(m.get("decision") or "").lower().startswith("reject")]
+    conflicting=bool(adverse and positive)
+    ids=[int(m["id"]) for m in relevant if m.get("id") is not None]
+    review_rows=s.scalars(select(Review).where(Review.proposal_id.in_(ids)).order_by(Review.created_at.desc())).all() if ids else []
+    reason_parts=[str(m.get(k) or "") for m in relevant for k in ("observations","outcome","decision")]
+    reason_parts.extend(x.reason for x in review_rows)
+    evidence_text=" ".join(reason_parts).lower()
+    recurring_terms=["privacy","security","budget","cost","training","maintenance","staffing","procurement","delay","compliance","retention","access","evidence","deployment","reliability","feasibility","safety","funding","timeline","integration","data quality","interoperability"]
+    concerns=[term for term in recurring_terms if evidence_text.count(term)>=2]
+    missing_outcomes=[{"reference":m.get("reference"),"title":m.get("title"),"status":m.get("status")} for m in positive if not str(m.get("outcome") or "").strip()]
+    departments=sorted({m.get("department_name") for m in relevant if m.get("department_name")})
+    if len(adverse)>=2:
+        signal="Elevated review"
+        basis=f"{len(adverse)} relevant records have a rejected, returned or modifications-requested status."
+    elif adverse or conflicting:
+        signal="Review required"
+        basis="At least one relevant adverse precedent exists; compare its recorded reason with the current proposal."
+    elif positive:
+        signal="No adverse precedent found"
+        basis="Relevant successful precedents were found, but this does not prove the current proposal is safe or suitable."
+    else:
+        signal="Insufficient historical evidence"
+        basis="No sufficiently similar indexed record crossed the screening threshold."
+    checks=[]
+    if adverse: checks.append("Read the original rejection/return/modification reasons and show how the current proposal addresses them.")
+    if conflicting: checks.append("The archive contains both successful and adverse precedents; compare their assumptions, scope and implementation conditions.")
+    if positive: checks.append("Compare intended benefits with the recorded implementation outcomes of the successful precedents.")
+    if missing_outcomes: checks.append("Some comparable approved/closed records lack a recorded outcome; verify whether the intended benefits were actually delivered.")
+    if concerns: checks.append("Check recurring recorded concerns: "+", ".join(concerns)+".")
+    if not checks: checks.append("Confirm with the relevant departments whether additional historical files or decisions exist before reaching a decision.")
+    return {
+        "signal_level":signal,
+        "basis":basis,
+        "relevant_records_examined":len(relevant),
+        "adverse_precedents":[{"reference":m.get("reference"),"title":m.get("title"),"status":m.get("status"),"decision":m.get("decision"),"observations":m.get("observations"),"similarity":m.get("similarity")} for m in adverse[:5]],
+        "successful_precedents":[{"reference":m.get("reference"),"title":m.get("title"),"status":m.get("status"),"decision":m.get("decision"),"outcome":m.get("outcome"),"similarity":m.get("similarity")} for m in positive[:5]],
+        "conflicting_precedents":conflicting,
+        "recurring_concerns":concerns,
+        "missing_outcomes":missing_outcomes[:5],
+        "departments_represented":departments,
+        "checks_before_decision":checks,
+        "disclaimer":"This is an explainable screening aid based on recorded historical data and similarity. It is not a calibrated risk probability, a legal assessment, or an automated recommendation to approve or reject. Verify each source record."
+    }
+
+
+@app.post("/precedents/preview")
+def preview_precedents(body:PrecedentPreviewIn,u=Depends(current),s:Session=Depends(db)):
+    query="\n".join([body.title,body.summary,body.category,body.priority])
+    matches=retrieve_precedents(s,query,limit=10)
+    return {"query":query,"method":matches[0]["method"] if matches else ("semantic pgvector" if embedding(query) and DATABASE_URL.startswith("postgresql") else "lexical fallback"),
+        "matches":matches,"impact_brief":build_impact_brief(s,matches)}
+
+
+@app.get("/proposals/{pid}/impact-brief")
+def proposal_impact_brief(pid:int,u=Depends(current),s:Session=Depends(db)):
+    p=s.get(Proposal,pid)
+    if not p: raise HTTPException(404,"Proposal not found")
+    if not can_access_proposal(s,u,p): raise HTTPException(403,"Not authorized for this proposal")
+    query="\n".join([p.title,p.summary,p.category,p.decision or "",p.observations or "",p.outcome or ""])
+    matches=retrieve_precedents(s,query,exclude_id=pid,limit=10)
+    return {"proposal_reference":p.reference,"method":matches[0]["method"] if matches else "no_matches",
+        "matches":matches,"impact_brief":build_impact_brief(s,matches)}
+
+
 @app.get("/proposals/{pid}/precedents")
 def precedents(pid:int,u=Depends(current),s:Session=Depends(db)):
     p=s.get(Proposal,pid)
     if not p:raise HTTPException(404,"Proposal not found")
     if not can_access_proposal(s,u,p): raise HTTPException(403,"Not authorized for this proposal")
-    candidates=[x for x in s.scalars(select(Proposal).where(Proposal.id!=pid,Proposal.status!="Draft")).all()]; query="\n".join([p.title,p.summary,p.category,p.decision or "",p.observations or "",p.outcome or ""]); qv=embedding(query)
-    # pgvector does the ranking in PostgreSQL when model weights are available. Any model/database
-    # failure deliberately falls back to deterministic lexical retrieval rather than inventing a score.
-    if qv and DATABASE_URL.startswith("postgresql"):
-        try:
-            rows=s.execute(select(Proposal,ProposalEmbedding.vector.cosine_distance(qv).label("distance")).join(ProposalEmbedding,ProposalEmbedding.proposal_id==Proposal.id).where(Proposal.id!=pid,Proposal.status!="Draft").order_by("distance").limit(10)).all()
-            if rows: return [{**proposal_dict(x),"similarity":round(max(0,100*(1-float(distance))),1),"matched_excerpt":(x.summary+"\nDecision: "+(x.decision or "Not recorded")+"\nObservations: "+(x.observations or "Not recorded")+"\nOutcome: "+(x.outcome or "Not recorded"))[:420],"method":"semantic pgvector"} for x,distance in rows]
-        except Exception: s.rollback()
-    return [{**proposal_dict(x),"similarity":score(query,x),"matched_excerpt":(x.summary+"\nDecision: "+(x.decision or "Not recorded")+"\nObservations: "+(x.observations or "Not recorded")+"\nOutcome: "+(x.outcome or "Not recorded"))[:420],"method":"lexical fallback"} for x in sorted(candidates,key=lambda x:score(query,x),reverse=True)[:10]]
+    query="\n".join([p.title,p.summary,p.category,p.decision or "",p.observations or "",p.outcome or ""])
+    return retrieve_precedents(s,query,exclude_id=pid,limit=10)
 @app.post("/proposals/{pid}/implementation")
 def implementation(pid:int,body:ImplementationIn,u=Depends(allow("Implementation Officer","Admin")),s:Session=Depends(db)):
     p=s.get(Proposal,pid)
