@@ -15,7 +15,7 @@ Copy-Item .env.example .env
 docker compose up --build
 ```
 
-The migration runs automatically before the API starts. Open `http://localhost:5173`; the API health endpoint is `http://localhost:8000/health`. Production API documentation is intentionally disabled.
+The migration runs automatically before the API starts. By default open `http://localhost:5173`; the API health endpoint is `http://localhost:8000/health`. Override `WEB_PORT`, `API_PORT`, or `DB_PORT` when another local service already uses those ports. Production API documentation is intentionally disabled.
 
 For a demo deployment only, set `DEMO_SEED=true` before the first start. Demo accounts all use `Demo@123`. Never use demo accounts or passwords in a real deployment.
 

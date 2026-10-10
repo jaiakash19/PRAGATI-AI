@@ -214,7 +214,7 @@ def precedents(pid:int,u=Depends(current),s:Session=Depends(db)):
     if qv and DATABASE_URL.startswith("postgresql"):
         try:
             rows=s.execute(select(Proposal,ProposalEmbedding.vector.cosine_distance(qv).label("distance")).join(ProposalEmbedding,ProposalEmbedding.proposal_id==Proposal.id).where(Proposal.id!=pid,Proposal.status.in_(["Approved","Implemented","Closed"])).order_by("distance").limit(5)).all()
-            return [{**proposal_dict(x),"similarity":round(max(0,100*(1-float(distance))),1),"matched_excerpt":x.summary[:220],"method":"semantic pgvector"} for x,distance in rows]
+            if rows: return [{**proposal_dict(x),"similarity":round(max(0,100*(1-float(distance))),1),"matched_excerpt":x.summary[:220],"method":"semantic pgvector"} for x,distance in rows]
         except Exception: s.rollback()
     return [{**proposal_dict(x),"similarity":score(query,x),"matched_excerpt":x.summary[:220],"method":"lexical fallback"} for x in sorted(candidates,key=lambda x:score(query,x),reverse=True)[:5]]
 @app.post("/proposals/{pid}/implementation")

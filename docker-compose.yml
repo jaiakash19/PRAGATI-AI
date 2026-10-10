@@ -5,7 +5,7 @@ services:
       POSTGRES_DB: ${POSTGRES_DB:-ipmprs}
       POSTGRES_USER: ${POSTGRES_USER:-ipmprs}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
-    ports: ["5432:5432"]
+    ports: ["${DB_PORT:-5432}:5432"]
     volumes: [postgres_data:/var/lib/postgresql/data]
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
@@ -21,7 +21,7 @@ services:
       CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:5173}
       UPLOAD_DIR: /data/uploads
       DEMO_SEED: ${DEMO_SEED:-false}
-    ports: ["8000:8000"]
+    ports: ["${API_PORT:-8000}:8000"]
     volumes: [uploads_data:/data/uploads]
     depends_on:
       db:
@@ -33,7 +33,7 @@ services:
       retries: 6
   web:
     build: ./frontend
-    ports: ["5173:80"]
+    ports: ["${WEB_PORT:-5173}:80"]
     depends_on:
       api:
         condition: service_healthy
