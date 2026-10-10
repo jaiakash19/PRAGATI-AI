@@ -99,7 +99,14 @@ def proposal_dict(p): return {"id":p.id,"reference":p.reference,"title":p.title,
 def user_dict(x): return {"id":x.id,"name":x.name,"email":x.email,"role":x.role,"department_id":x.department_id,"active":x.active}
 def words(t): return set(re.findall(r"[a-z]{3,}",t.lower()))
 def score(query, p):
-    a,b=words(query),words(p.title+" "+p.summary+" "+(p.observations or "")+" "+(p.outcome or "")); return round(100*len(a&b)/max(1,len(a|b)),1)
+    """Explainable lexical fallback including recorded decisions, outcomes and extracted case-file text."""
+    parts = [p.title, p.summary, p.category, p.decision or "", p.observations or "", p.outcome or ""]
+    try:
+        parts.extend(d.extracted_text for d in p.documents if d.extracted_text)
+    except Exception:
+        pass
+    a, b = words(query), words(" ".join(parts))
+    return round(100 * len(a & b) / max(1, len(a | b)), 1)
 def embedding(text):
     """Lazy local model: no API key; returns None so lexical fallback remains available offline."""
     global _embedding_model

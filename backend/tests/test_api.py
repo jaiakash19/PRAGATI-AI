@@ -1,4 +1,5 @@
 import os
+import pytest
 os.environ["DATABASE_URL"]="sqlite:///./test_ipmprs.db"
 from fastapi.testclient import TestClient
 try:
@@ -6,6 +7,11 @@ try:
 except ModuleNotFoundError:  # supports local tests from the backend folder
     from app import main as main_module
 app = main_module.app
+
+@pytest.fixture(autouse=True)
+def disable_embedding_model_downloads(monkeypatch):
+    # Keep API tests fast and deterministic; semantic-vector retrieval needs a separate model-enabled test environment.
+    monkeypatch.setattr(main_module, "embedding", lambda text: None)
 def test_login_and_dashboard():
     with TestClient(app) as c:
         r=c.post("/auth/login",json={"email":"admin@ipmprs.demo","password":"Demo@123"});assert r.status_code==200
