@@ -12,7 +12,7 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from jose import JWTError, jwt
 from passlib.context import CryptContext
 from pydantic import BaseModel, Field
-from sqlalchemy import DateTime, ForeignKey, Integer, LargeBinary, String, Text, JSON, create_engine, select, func, text, or_
+from sqlalchemy import DateTime, ForeignKey, Integer, LargeBinary, Float, String, Text, JSON, create_engine, select, func, text, or_
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, relationship, sessionmaker
 
 APP_ENV = os.getenv("APP_ENV", "development").lower()
@@ -42,6 +42,8 @@ class User(Base):
 class Proposal(Base):
     __tablename__="proposals"; id: Mapped[int]=mapped_column(primary_key=True); reference: Mapped[str]=mapped_column(String(40), unique=True); title: Mapped[str]=mapped_column(String(240)); summary: Mapped[str]=mapped_column(Text); category: Mapped[str]=mapped_column(String(80)); priority: Mapped[str]=mapped_column(String(20), default="Medium"); status: Mapped[str]=mapped_column(String(30), default="Draft"); author_id: Mapped[int]=mapped_column(ForeignKey("users.id")); department_id: Mapped[Optional[int]]=mapped_column(ForeignKey("departments.id")); created_at: Mapped[datetime]=mapped_column(DateTime, default=lambda:datetime.now(timezone.utc)); updated_at: Mapped[datetime]=mapped_column(DateTime, default=lambda:datetime.now(timezone.utc)); decision: Mapped[Optional[str]]=mapped_column(Text, nullable=True); observations: Mapped[Optional[str]]=mapped_column(Text, nullable=True); outcome: Mapped[Optional[str]]=mapped_column(Text, nullable=True)
     documents: Mapped[list["Document"]]=relationship(back_populates="proposal", cascade="all, delete-orphan")
+    decision_records: Mapped[list["DecisionRecord"]]=relationship(back_populates="proposal", cascade="all, delete-orphan")
+    precedent_visible: Mapped[bool]=mapped_column(default=False, nullable=False)
 class Document(Base):
     __tablename__="documents"; id: Mapped[int]=mapped_column(primary_key=True); proposal_id: Mapped[int]=mapped_column(ForeignKey("proposals.id")); filename: Mapped[str]=mapped_column(String(255)); stored_name: Mapped[str]=mapped_column(String(255)); content_type: Mapped[str]=mapped_column(String(100)); extracted_text: Mapped[str]=mapped_column(Text, default=""); content_blob: Mapped[Optional[bytes]]=mapped_column(LargeBinary, nullable=True); document_type: Mapped[str]=mapped_column(String(50), default="Supporting Document"); ocr_status: Mapped[str]=mapped_column(String(40), default="not_required"); version: Mapped[int]=mapped_column(Integer, default=1); uploaded_at: Mapped[datetime]=mapped_column(DateTime, default=lambda:datetime.now(timezone.utc)); proposal: Mapped[Proposal]=relationship(back_populates="documents")
 class ProposalEmbedding(Base):
@@ -50,6 +52,21 @@ class Assignment(Base):
     __tablename__="assignments"; id: Mapped[int]=mapped_column(primary_key=True); proposal_id: Mapped[int]=mapped_column(ForeignKey("proposals.id")); user_id: Mapped[int]=mapped_column(ForeignKey("users.id")); role: Mapped[str]=mapped_column(String(50))
 class Review(Base):
     __tablename__="reviews"; id: Mapped[int]=mapped_column(primary_key=True); proposal_id: Mapped[int]=mapped_column(ForeignKey("proposals.id")); reviewer_id: Mapped[int]=mapped_column(ForeignKey("users.id")); action: Mapped[str]=mapped_column(String(50)); reason: Mapped[str]=mapped_column(Text); created_at: Mapped[datetime]=mapped_column(DateTime, default=lambda:datetime.now(timezone.utc))
+class DecisionRecord(Base):
+    __tablename__="decision_records"
+    id: Mapped[int]=mapped_column(primary_key=True)
+    proposal_id: Mapped[int]=mapped_column(ForeignKey("proposals.id"), nullable=False)
+    recorded_by_id: Mapped[int]=mapped_column(ForeignKey("users.id"), nullable=False)
+    record_type: Mapped[str]=mapped_column(String(30), nullable=False)
+    title: Mapped[str]=mapped_column(String(240), nullable=False)
+    details: Mapped[str]=mapped_column(Text, nullable=False)
+    reference_number: Mapped[Optional[str]]=mapped_column(String(100), nullable=True)
+    amount: Mapped[Optional[float]]=mapped_column(Float, nullable=True)
+    currency: Mapped[str]=mapped_column(String(3), default="INR", nullable=False)
+    effective_date: Mapped[Optional[datetime]]=mapped_column(DateTime, nullable=True)
+    created_at: Mapped[datetime]=mapped_column(DateTime, default=lambda:datetime.now(timezone.utc))
+    proposal: Mapped[Proposal]=relationship(back_populates="decision_records")
+
 class Implementation(Base):
     __tablename__="implementations"; id: Mapped[int]=mapped_column(primary_key=True); proposal_id: Mapped[int]=mapped_column(ForeignKey("proposals.id"), unique=True); progress: Mapped[int]=mapped_column(Integer, default=0); milestone: Mapped[str]=mapped_column(String(240), default="Initiated"); evidence: Mapped[str]=mapped_column(Text, default=""); closed_at: Mapped[Optional[datetime]]=mapped_column(DateTime, nullable=True)
 class Notification(Base):
@@ -69,6 +86,16 @@ class PrecedentPreviewIn(BaseModel):
     summary:str=Field(min_length=10,max_length=10000)
     category:str=Field(min_length=2,max_length=80)
     priority:str="Medium"
+class DecisionRecordIn(BaseModel):
+    record_type:str=Field(min_length=3,max_length=30)
+    title:str=Field(min_length=3,max_length=240)
+    details:str=Field(min_length=3,max_length=10000)
+    reference_number:Optional[str]=Field(default=None,max_length=100)
+    amount:Optional[float]=Field(default=None,gt=0)
+    currency:str=Field(default="INR",min_length=3,max_length=3)
+    effective_date:Optional[datetime]=None
+class PrecedentVisibilityIn(BaseModel):
+    visible:bool
 
 def db():
     with SessionLocal() as s: yield s
@@ -100,14 +127,18 @@ def visible_to(u):
 def assignment_allows(s, u, p):
     assignments=list(s.scalars(select(Assignment).where(Assignment.proposal_id==p.id)).all())
     return not assignments or any(a.user_id==u.id for a in assignments)
-def proposal_dict(p): return {"id":p.id,"reference":p.reference,"title":p.title,"summary":p.summary,"category":p.category,"priority":p.priority,"status":p.status,"created_at":p.created_at,"decision":p.decision,"observations":p.observations,"outcome":p.outcome}
+def decision_record_dict(r):
+    return {"id":r.id,"proposal_id":r.proposal_id,"recorded_by_id":r.recorded_by_id,"record_type":r.record_type,"title":r.title,"details":r.details,"reference_number":r.reference_number,"amount":r.amount,"currency":r.currency,"effective_date":r.effective_date,"created_at":r.created_at}
+
+def proposal_dict(p): return {"id":p.id,"reference":p.reference,"title":p.title,"summary":p.summary,"category":p.category,"priority":p.priority,"status":p.status,"created_at":p.created_at,"decision":p.decision,"observations":p.observations,"outcome":p.outcome,"precedent_visible":bool(p.precedent_visible)}
 def user_dict(x): return {"id":x.id,"name":x.name,"email":x.email,"role":x.role,"department_id":x.department_id,"active":x.active}
 def words(t): return set(re.findall(r"[a-z]{3,}",t.lower()))
 def score(query, p):
-    """Explainable lexical fallback including recorded decisions, outcomes and extracted case-file text."""
+    """Explainable lexical fallback including structured decisions, sanctions and extracted case-file text."""
     parts = [p.title, p.summary, p.category, p.decision or "", p.observations or "", p.outcome or ""]
     try:
         parts.extend(d.extracted_text for d in p.documents if d.extracted_text)
+        parts.extend(" ".join([r.record_type, r.title, r.details, r.reference_number or "", str(r.amount or ""), r.currency]) for r in p.decision_records)
     except Exception:
         pass
     a, b = words(query), words(" ".join(parts))
@@ -124,7 +155,7 @@ def embedding(text):
 def cosine(a,b): return round(100*sum(x*y for x,y in zip(a,b)),1)
 def proposal_embedding_text(p):
     """Canonical text representation used consistently for proposal embeddings."""
-    return "\n".join([p.title, p.summary, p.category, p.decision or "", p.observations or "", p.outcome or ""] + [f"Document type: {d.document_type}\nDocument: {d.filename}\n{d.extracted_text}" for d in p.documents]).strip()
+    return "\n".join([p.title, p.summary, p.category, p.decision or "", p.observations or "", p.outcome or ""] + [f"Document type: {d.document_type}\nDocument: {d.filename}\n{d.extracted_text}" for d in p.documents] + [f"{r.record_type}: {r.title}\n{r.details}\nReference: {r.reference_number or ''}\nAmount: {r.amount or ''} {r.currency}" for r in p.decision_records]).strip()
 
 def store_embedding(s, p):
     source=proposal_embedding_text(p)
@@ -273,13 +304,68 @@ def update_proposal(pid:int,body:ProposalUpdate,u=Depends(current),s:Session=Dep
     if u.role!="Admin" and p.author_id!=u.id: raise HTTPException(403,"Only the author may edit this proposal")
     if p.status not in {"Draft","Modifications Requested"}: raise HTTPException(409,"Only draft or returned proposals can be edited")
     for k,v in body.model_dump().items(): setattr(p,k,v)
-    p.updated_at=datetime.now(timezone.utc); audit(s,u,"Updated","proposal",pid);s.commit();return proposal_dict(p)
+    p.updated_at=datetime.now(timezone.utc); store_embedding(s,p); audit(s,u,"Updated","proposal",pid);s.commit();return proposal_dict(p)
 @app.get("/proposals/{pid}")
 def get_proposal(pid:int,u=Depends(current),s:Session=Depends(db)):
     p=s.get(Proposal,pid)
     if not p:raise HTTPException(404,"Proposal not found")
     if not can_access_proposal(s,u,p): raise HTTPException(403,"Not authorized for this proposal")
-    r=proposal_dict(p);r["documents"]=[{"id":d.id,"filename":d.filename,"version":d.version,"uploaded_at":d.uploaded_at,"content_type":d.content_type,"document_type":d.document_type,"ocr_status":d.ocr_status,"extracted_text_length":len(d.extracted_text or "")} for d in p.documents];r["reviews"]=[{"action":x.action,"reason":x.reason,"created_at":x.created_at} for x in s.scalars(select(Review).where(Review.proposal_id==pid)).all()]; impl=s.scalar(select(Implementation).where(Implementation.proposal_id==pid));r["implementation"]={"progress":impl.progress,"milestone":impl.milestone,"evidence":impl.evidence,"closed_at":impl.closed_at} if impl else None;r["assignments"]=[{"id":a.id,"user_id":a.user_id,"role":a.role} for a in s.scalars(select(Assignment).where(Assignment.proposal_id==pid)).all()];return r
+    r=proposal_dict(p);r["documents"]=[{"id":d.id,"filename":d.filename,"version":d.version,"uploaded_at":d.uploaded_at,"content_type":d.content_type,"document_type":d.document_type,"ocr_status":d.ocr_status,"extracted_text_length":len(d.extracted_text or "")} for d in p.documents];r["decision_records"]=[decision_record_dict(x) for x in sorted(p.decision_records,key=lambda z:z.created_at,reverse=True)];r["reviews"]=[{"action":x.action,"reason":x.reason,"created_at":x.created_at} for x in s.scalars(select(Review).where(Review.proposal_id==pid)).all()]; impl=s.scalar(select(Implementation).where(Implementation.proposal_id==pid));r["implementation"]={"progress":impl.progress,"milestone":impl.milestone,"evidence":impl.evidence,"closed_at":impl.closed_at} if impl else None;r["assignments"]=[{"id":a.id,"user_id":a.user_id,"role":a.role} for a in s.scalars(select(Assignment).where(Assignment.proposal_id==pid)).all()];return r
+
+@app.get("/proposals/{pid}/decision-records")
+def list_decision_records(pid:int,u=Depends(current),s:Session=Depends(db)):
+    p=s.get(Proposal,pid)
+    if not p: raise HTTPException(404,"Proposal not found")
+    if not can_access_proposal(s,u,p): raise HTTPException(403,"Not authorized for this proposal")
+    return [decision_record_dict(r) for r in s.scalars(select(DecisionRecord).where(DecisionRecord.proposal_id==pid).order_by(DecisionRecord.created_at.desc())).all()]
+
+@app.post("/proposals/{pid}/decision-records")
+def create_decision_record(pid:int,body:DecisionRecordIn,u=Depends(current),s:Session=Depends(db)):
+    p=s.get(Proposal,pid)
+    if not p: raise HTTPException(404,"Proposal not found")
+    if not can_access_proposal(s,u,p): raise HTTPException(403,"Not authorized for this proposal")
+    record_type=body.record_type.strip().title()
+    role_map={
+        "Decision":{"Admin","Approving Officer"},
+        "Sanction":{"Admin","Approving Officer"},
+        "Observation":{"Admin","Reviewer","Approving Officer","Implementation Officer"},
+        "Modification":{"Admin","Reviewer"},
+        "Outcome":{"Admin","Implementation Officer"}
+    }
+    if record_type not in role_map: raise HTTPException(422,"Record type must be Decision, Sanction, Observation, Modification or Outcome.")
+    if u.role not in role_map[record_type]: raise HTTPException(403,"Your role cannot create this record type.")
+    if record_type=="Sanction" and p.status not in {"Approved","Implemented","Closed"}:
+        raise HTTPException(409,"A sanction can be recorded only after proposal approval.")
+    if record_type=="Outcome" and p.status not in {"Approved","Implemented","Closed"}:
+        raise HTTPException(409,"An implementation outcome requires an approved proposal.")
+    if body.amount is not None and record_type!="Sanction":
+        raise HTTPException(422,"Amount is only valid for a sanction record.")
+    record=DecisionRecord(proposal_id=pid,recorded_by_id=u.id,record_type=record_type,title=body.title.strip(),
+        details=body.details.strip(),reference_number=body.reference_number.strip() if body.reference_number else None,
+        amount=body.amount,currency=body.currency.upper(),effective_date=body.effective_date)
+    p.decision_records.append(record)
+    s.add(record)
+    s.flush()
+    store_embedding(s,p)
+    audit(s,u,"Recorded "+record_type.lower(),"decision_record",record.id,
+          f"{record.title}; reference={record.reference_number or 'none'}; amount={record.amount or 'none'} {record.currency}")
+    s.commit()
+    return decision_record_dict(record)
+
+@app.post("/proposals/{pid}/precedent-visibility")
+def set_precedent_visibility(pid:int,body:PrecedentVisibilityIn,u=Depends(current),s:Session=Depends(db)):
+    if u.role not in {"Admin","Approving Officer"}: raise HTTPException(403,"Only Admin or an Approving Officer can publish an institutional precedent.")
+    p=s.get(Proposal,pid)
+    if not p: raise HTTPException(404,"Proposal not found")
+    if p.status not in {"Approved","Rejected","Modifications Requested","Implemented","Closed"}:
+        raise HTTPException(409,"Only a reviewed or completed proposal can be published as an institutional precedent.")
+    p.precedent_visible=body.visible
+    p.updated_at=datetime.now(timezone.utc)
+    store_embedding(s,p)
+    audit(s,u,"Published as institutional precedent" if body.visible else "Removed from institutional precedents","proposal",pid)
+    s.commit()
+    return {"id":p.id,"reference":p.reference,"precedent_visible":p.precedent_visible}
+
 @app.post("/proposals/{pid}/action")
 def action(pid:int,body:ActionIn,u=Depends(current),s:Session=Depends(db)):
     p=s.get(Proposal,pid)
@@ -291,11 +377,19 @@ def action(pid:int,body:ActionIn,u=Depends(current),s:Session=Depends(db)):
     if u.role not in roles:raise HTTPException(403,"Role cannot perform this action")
     if p.status not in states: raise HTTPException(409,f"Cannot {body.action} a proposal in {p.status}")
     if u.role != "Admin" and not assignment_allows(s,u,p): raise HTTPException(403,"Proposal is assigned to another officer")
-    p.status=new;p.decision=body.action.title() if body.action in {"approve","reject"} else p.decision;p.observations=body.reason;p.updated_at=datetime.now(timezone.utc);s.add(Review(proposal_id=pid,reviewer_id=u.id,action=body.action,reason=body.reason)); notify(s,p.author_id,f"{p.reference}: {new}. {body.reason}");store_embedding(s,p);audit(s,u,body.action,"proposal",pid,body.reason);s.commit();return proposal_dict(p)
-def retrieve_precedents(s:Session, query:str, exclude_id:Optional[int]=None, limit:int=10):
-    """Retrieve institutionally relevant historical records; never silently discard rejected/modified cases."""
+    p.status=new;p.decision=body.action.title() if body.action in {"approve","reject"} else p.decision;p.observations=body.reason;p.updated_at=datetime.now(timezone.utc);s.add(Review(proposal_id=pid,reviewer_id=u.id,action=body.action,reason=body.reason))
+    record_type={"approve":"Decision","reject":"Decision","modifications":"Modification","review":"Observation","recommend":"Observation"}.get(body.action)
+    if record_type:
+        p.decision_records.append(DecisionRecord(recorded_by_id=u.id,record_type=record_type,title=f"{new} — {p.reference}",details=body.reason))
+    notify(s,p.author_id,f"{p.reference}: {new}. {body.reason}");store_embedding(s,p);audit(s,u,body.action,"proposal",pid,body.reason);s.commit();return proposal_dict(p)
+def retrieve_precedents(s:Session, query:str, exclude_id:Optional[int]=None, limit:int=10, user=None):
+    """Retrieve historical records with role-scoped visibility and an explicit publication boundary."""
     filters=[Proposal.status!="Draft"]
     if exclude_id is not None: filters.append(Proposal.id!=exclude_id)
+    if user is not None and user.role=="Submitter":
+        filters.append(or_(Proposal.author_id==user.id,
+            Proposal.id.in_(select(Assignment.proposal_id).where(Assignment.user_id==user.id)),
+            Proposal.precedent_visible.is_(True)))
     candidates=s.scalars(select(Proposal).where(*filters)).all()
     qv=embedding(query)
     if qv and DATABASE_URL.startswith("postgresql"):
@@ -314,6 +408,7 @@ def retrieve_precedents(s:Session, query:str, exclude_id:Optional[int]=None, lim
                         +"\nOutcome: "+(proposal.outcome or "Not recorded"))
                     items.append({**proposal_dict(proposal),"department_name":department.name if department else "Unspecified",
                         "similarity":round(max(0,100*(1-float(distance))),1),"matched_excerpt":excerpt[:520],
+                        "decision_records":[decision_record_dict(r) for r in proposal.decision_records],
                         "method":"semantic pgvector"})
                 return items
         except Exception:
@@ -325,7 +420,9 @@ def retrieve_precedents(s:Session, query:str, exclude_id:Optional[int]=None, lim
             +"\nObservations: "+(proposal.observations or "Not recorded")
             +"\nOutcome: "+(proposal.outcome or "Not recorded"))
         items.append({**proposal_dict(proposal),"department_name":department.name if department else "Unspecified",
-            "similarity":score(query,proposal),"matched_excerpt":excerpt[:520],"method":"lexical fallback"})
+            "similarity":score(query,proposal),"matched_excerpt":excerpt[:520],
+            "decision_records":[decision_record_dict(r) for r in proposal.decision_records],
+            "method":"lexical fallback"})
     return items
 
 
@@ -341,7 +438,9 @@ def build_impact_brief(s:Session, matches:list):
     conflicting=bool(adverse and positive)
     ids=[int(m["id"]) for m in relevant if m.get("id") is not None]
     review_rows=s.scalars(select(Review).where(Review.proposal_id.in_(ids)).order_by(Review.created_at.desc())).all() if ids else []
+    sanctions=[{"reference":m.get("reference"),"title":m.get("title"),"record_title":r.get("title"),"details":r.get("details"),"reference_number":r.get("reference_number"),"amount":r.get("amount"),"currency":r.get("currency"),"effective_date":r.get("effective_date")} for m in relevant for r in m.get("decision_records",[]) if r.get("record_type")=="Sanction"]
     reason_parts=[str(m.get(k) or "") for m in relevant for k in ("observations","outcome","decision")]
+    reason_parts.extend(str(r.get("details") or "") for m in relevant for r in m.get("decision_records",[]))
     reason_parts.extend(x.reason for x in review_rows)
     evidence_text=" ".join(reason_parts).lower()
     recurring_terms=["privacy","security","budget","cost","training","maintenance","staffing","procurement","delay","compliance","retention","access","evidence","deployment","reliability","feasibility","safety","funding","timeline","integration","data quality","interoperability"]
@@ -365,6 +464,7 @@ def build_impact_brief(s:Session, matches:list):
     if conflicting: checks.append("The archive contains both successful and adverse precedents; compare their assumptions, scope and implementation conditions.")
     if positive: checks.append("Compare intended benefits with the recorded implementation outcomes of the successful precedents.")
     if missing_outcomes: checks.append("Some comparable approved/closed records lack a recorded outcome; verify whether the intended benefits were actually delivered.")
+    if sanctions: checks.append("Compare prior sanction references, approved amounts and conditions with the current proposal; an earlier sanction does not automatically apply.")
     if concerns: checks.append("Check recurring recorded concerns: "+", ".join(concerns)+".")
     if not checks: checks.append("Confirm with the relevant departments whether additional historical files or decisions exist before reaching a decision.")
     return {
@@ -376,6 +476,7 @@ def build_impact_brief(s:Session, matches:list):
         "conflicting_precedents":conflicting,
         "recurring_concerns":concerns,
         "missing_outcomes":missing_outcomes[:5],
+        "sanctions":sanctions[:10],
         "departments_represented":departments,
         "checks_before_decision":checks,
         "disclaimer":"This is an explainable screening aid based on recorded historical data and similarity. It is not a calibrated risk probability, a legal assessment, or an automated recommendation to approve or reject. Verify each source record."
@@ -385,7 +486,7 @@ def build_impact_brief(s:Session, matches:list):
 @app.post("/precedents/preview")
 def preview_precedents(body:PrecedentPreviewIn,u=Depends(current),s:Session=Depends(db)):
     query="\n".join([body.title,body.summary,body.category,body.priority])
-    matches=retrieve_precedents(s,query,limit=10)
+    matches=retrieve_precedents(s,query,limit=10,user=u)
     return {"query":query,"method":matches[0]["method"] if matches else ("semantic pgvector" if embedding(query) and DATABASE_URL.startswith("postgresql") else "lexical fallback"),
         "matches":matches,"impact_brief":build_impact_brief(s,matches)}
 
@@ -396,7 +497,7 @@ def proposal_impact_brief(pid:int,u=Depends(current),s:Session=Depends(db)):
     if not p: raise HTTPException(404,"Proposal not found")
     if not can_access_proposal(s,u,p): raise HTTPException(403,"Not authorized for this proposal")
     query="\n".join([p.title,p.summary,p.category,p.decision or "",p.observations or "",p.outcome or ""])
-    matches=retrieve_precedents(s,query,exclude_id=pid,limit=10)
+    matches=retrieve_precedents(s,query,exclude_id=pid,limit=10,user=u)
     return {"proposal_reference":p.reference,"method":matches[0]["method"] if matches else "no_matches",
         "matches":matches,"impact_brief":build_impact_brief(s,matches)}
 
@@ -407,7 +508,7 @@ def precedents(pid:int,u=Depends(current),s:Session=Depends(db)):
     if not p:raise HTTPException(404,"Proposal not found")
     if not can_access_proposal(s,u,p): raise HTTPException(403,"Not authorized for this proposal")
     query="\n".join([p.title,p.summary,p.category,p.decision or "",p.observations or "",p.outcome or ""])
-    return retrieve_precedents(s,query,exclude_id=pid,limit=10)
+    return retrieve_precedents(s,query,exclude_id=pid,limit=10,user=u)
 @app.post("/admin/reindex-embeddings")
 def reindex_embeddings(u=Depends(allow("Admin")),s:Session=Depends(db)):
     """Batch-rebuild the historical proposal vector index after imports or model setup."""
@@ -451,6 +552,7 @@ def implementation(pid:int,body:ImplementationIn,u=Depends(allow("Implementation
     rec=s.scalar(select(Implementation).where(Implementation.proposal_id==pid)) or Implementation(proposal_id=pid);rec.progress=body.progress;rec.milestone=body.milestone;rec.evidence=body.evidence
     if body.progress==100:rec.closed_at=datetime.now(timezone.utc);p.status="Closed";p.outcome=body.evidence
     else:p.status="Implemented"
+    p.decision_records.append(DecisionRecord(recorded_by_id=u.id,record_type="Outcome",title=f"Implementation milestone: {body.milestone}",details=body.evidence or f"Progress recorded at {body.progress} percent."))
     s.add(rec);store_embedding(s,p);audit(s,u,"Updated implementation","proposal",pid);s.commit();return {"progress":rec.progress,"status":p.status}
 @app.post("/proposals/{pid}/documents")
 def upload(pid:int,file:UploadFile=File(...),document_type:str=Form("Case File"),u=Depends(allow("Admin","Submitter")),s:Session=Depends(db)):

@@ -163,3 +163,112 @@ def test_admin_can_reindex_historical_proposal_archive(monkeypatch):
         data=response.json()
         assert data["indexed"] == data["total"]
         assert data["dimensions"] == 384
+
+
+def test_structured_sanction_history_is_saved_and_retrievable():
+    with TestClient(app) as c:
+        def auth(email):
+            response=c.post("/auth/login",json={"email":email,"password":"Demo@123"})
+            assert response.status_code==200
+            return {"Authorization":"Bearer "+response.json()["token"]}
+        submitter=auth("submitter@ipmprs.demo")
+        reviewer=auth("reviewer@ipmprs.demo")
+        approver=auth("approver@ipmprs.demo")
+        created=c.post("/proposals",headers=submitter,json={
+            "title":"Digital evidence storage expansion",
+            "summary":"Expand digital evidence storage capacity with encryption, audit and retention controls.",
+            "category":"Technology","priority":"High"
+        })
+        assert created.status_code==200
+        p=created.json()
+        for headers,action in [(submitter,"submit"),(reviewer,"review"),(reviewer,"recommend"),(approver,"approve")]:
+            response=c.post(f"/proposals/{p['id']}/action",headers=headers,json={"action":action,"reason":"Review record for structured audit."})
+            assert response.status_code==200,response.text
+        sanction=c.post(f"/proposals/{p['id']}/decision-records",headers=approver,json={
+            "record_type":"Sanction","title":"Phase I administrative sanction",
+            "details":"Approved for phase I subject to quarterly expenditure review and retention compliance.",
+            "reference_number":"SAN-TEST-2026-01","amount":125000.50,"currency":"INR",
+            "effective_date":"2026-10-15T00:00:00Z"
+        })
+        assert sanction.status_code==200,sanction.text
+        assert sanction.json()["record_type"]=="Sanction"
+        assert sanction.json()["reference_number"]=="SAN-TEST-2026-01"
+        assert sanction.json()["amount"]==125000.50
+        assert c.post(f"/proposals/{p['id']}/decision-records",headers=submitter,json={
+            "record_type":"Sanction","title":"Unauthorised sanction","details":"Should not be allowed."
+        }).status_code==403
+        detail=c.get(f"/proposals/{p['id']}",headers=submitter)
+        assert detail.status_code==200
+        kinds={r["record_type"] for r in detail.json()["decision_records"]}
+        assert {"Decision","Observation","Sanction"}.issubset(kinds)
+        assert any(r["reference_number"]=="SAN-TEST-2026-01" for r in detail.json()["decision_records"])
+        preview=c.post("/precedents/preview",headers=submitter,json={
+            "title":"Digital evidence storage expansion",
+            "summary":"Expand digital evidence storage capacity with encryption, audit and retention controls.",
+            "category":"Technology","priority":"High"
+        })
+        assert preview.status_code==200
+        assert any(s["reference_number"]=="SAN-TEST-2026-01" for s in preview.json()["impact_brief"]["sanctions"])
+
+
+def test_submitter_precedent_scope_respects_curated_publication():
+    with TestClient(app) as c:
+        def auth(email):
+            response=c.post("/auth/login",json={"email":email,"password":"Demo@123"})
+            assert response.status_code==200
+            return {"Authorization":"Bearer "+response.json()["token"]}
+        submitter=auth("submitter@ipmprs.demo")
+        admin=auth("admin@ipmprs.demo")
+        token=os.urandom(5).hex()
+        with main_module.SessionLocal() as session:
+            admin_user=session.scalar(main_module.select(main_module.User).where(main_module.User.email=="admin@ipmprs.demo"))
+            remote=main_module.Department(name="Cross Department Test "+token)
+            session.add(remote);session.flush()
+            private=main_module.Proposal(reference="PRIV-"+token,title="Restricted spectral bridge telemetry",
+                summary="Confidential tungsten relay architecture for limited engineering review.",category="Technology",
+                priority="High",status="Closed",author_id=admin_user.id,department_id=remote.id,
+                decision="Approved",observations="Restricted design details.",outcome="Completed",precedent_visible=False)
+            published=main_module.Proposal(reference="PUB-"+token,title="Institutional radio equipment modernisation",
+                summary="Cross-department radio equipment modernisation and maintenance planning.",category="Technology",
+                priority="Medium",status="Closed",author_id=admin_user.id,department_id=remote.id,
+                decision="Approved",observations="Standard procurement controls.",outcome="Maintenance plan delivered.",precedent_visible=True)
+            session.add_all([private,published]);session.commit()
+            private_id,public_id=private.id,published.id
+        private_query=c.post("/precedents/preview",headers=submitter,json={
+            "title":"Restricted spectral bridge telemetry",
+            "summary":"Confidential tungsten relay architecture for limited engineering review.",
+            "category":"Technology","priority":"High"
+        })
+        assert private_query.status_code==200
+        assert all(x["id"]!=private_id for x in private_query.json()["matches"])
+        public_query=c.post("/precedents/preview",headers=submitter,json={
+            "title":"Institutional radio equipment modernisation",
+            "summary":"Cross-department radio equipment modernisation and maintenance planning.",
+            "category":"Technology","priority":"Medium"
+        })
+        assert public_query.status_code==200
+        assert any(x["id"]==public_id for x in public_query.json()["matches"])
+        staff_query=c.post("/precedents/preview",headers=admin,json={
+            "title":"Restricted spectral bridge telemetry",
+            "summary":"Confidential tungsten relay architecture for limited engineering review.",
+            "category":"Technology","priority":"High"
+        })
+        assert staff_query.status_code==200
+        assert any(x["id"]==private_id for x in staff_query.json()["matches"])
+
+
+def test_only_authorised_officers_can_publish_precedents():
+    with TestClient(app) as c:
+        def auth(email):
+            response=c.post("/auth/login",json={"email":email,"password":"Demo@123"})
+            assert response.status_code==200
+            return {"Authorization":"Bearer "+response.json()["token"]}
+        submitter=auth("submitter@ipmprs.demo")
+        approver=auth("approver@ipmprs.demo")
+        draft=c.post("/proposals",headers=submitter,json={
+            "title":"Precedent publication access test",
+            "summary":"Test who can publish a proposal as an institutional precedent.",
+            "category":"Training","priority":"Low"
+        }).json()
+        assert c.post(f"/proposals/{draft['id']}/precedent-visibility",headers=submitter,json={"visible":True}).status_code==403
+        assert c.post(f"/proposals/{draft['id']}/precedent-visibility",headers=approver,json={"visible":True}).status_code==409

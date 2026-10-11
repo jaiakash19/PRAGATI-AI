@@ -96,3 +96,13 @@ For public deployment, add TLS termination, malware scanning/object storage for 
 The proposal editor has a pre-submission precedent check, and every proposal detail page shows an evidence brief before review/approval. It compares positive and adverse historical records, flags contradictory precedent, lists recurring concerns from recorded observations/reviews, highlights missing recorded outcomes, and presents checks for the authorised officer. These are transparent heuristic screening cues, not a calibrated risk probability or an automatic approval/rejection decision.
 
 Existing or imported proposals can be batch-indexed by an Admin from Precedent Search using the Reindex historical archive button. It embeds title, summary, category, decision, observations, outcomes and extracted document text. Newly created proposals, workflow decisions and implementation updates also refresh their embedding. If the local Sentence Transformers model cannot be downloaded/loaded, precedent retrieval uses a labelled lexical fallback.
+
+
+## Structured decision and sanction history
+
+- Workflow actions automatically create structured Decision, Observation or Modification records alongside the review and audit log.
+- Approving Officers/Admins can record sanctions with rationale/conditions, reference/order number, optional amount/currency and effective date. The API prevents sanctions before approval.
+- Implementation milestones are captured as structured Outcome records and added to precedent embeddings and keyword fallback.
+- Admins/Approving Officers can explicitly publish a reviewed or completed proposal to the institutional precedent catalogue. Submitter searches include their own/assigned records plus published institutional precedents; reviewer and decision roles can search across departments according to their role.
+- New-proposal precedent suggestions refresh automatically while the title, summary, category or priority is edited (debounced to avoid sending a request for every keystroke). Proposal detail pages load the impact brief automatically.
+- Migration 0003_structured_decisions.py adds the structured records table and curated-publication flag to existing databases.
