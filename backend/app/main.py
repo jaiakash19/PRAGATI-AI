@@ -48,7 +48,7 @@ class CrossStationRequest(Base):
 class User(Base):
     __tablename__="users"; id: Mapped[int]=mapped_column(primary_key=True); name: Mapped[str]=mapped_column(String(120)); email: Mapped[str]=mapped_column(String(180), unique=True); password_hash: Mapped[str]=mapped_column(String(255)); role: Mapped[str]=mapped_column(String(40)); rank: Mapped[Optional[str]]=mapped_column(String(30), nullable=True); department_id: Mapped[Optional[int]]=mapped_column(ForeignKey("departments.id"), nullable=True); active: Mapped[bool]=mapped_column(default=True)
 class Proposal(Base):
-    __tablename__="proposals"; id: Mapped[int]=mapped_column(primary_key=True); reference: Mapped[str]=mapped_column(String(40), unique=True); title: Mapped[str]=mapped_column(String(240)); summary: Mapped[str]=mapped_column(Text); category: Mapped[str]=mapped_column(String(80)); priority: Mapped[str]=mapped_column(String(20), default="Medium"); status: Mapped[str]=mapped_column(String(30), default="Draft"); author_id: Mapped[int]=mapped_column(ForeignKey("users.id")); department_id: Mapped[Optional[int]]=mapped_column(ForeignKey("departments.id")); created_at: Mapped[datetime]=mapped_column(DateTime, default=lambda:datetime.now(timezone.utc)); updated_at: Mapped[datetime]=mapped_column(DateTime, default=lambda:datetime.now(timezone.utc)); decision: Mapped[Optional[str]]=mapped_column(Text, nullable=True); observations: Mapped[Optional[str]]=mapped_column(Text, nullable=True); outcome: Mapped[Optional[str]]=mapped_column(Text, nullable=True)
+    __tablename__="proposals"; id: Mapped[int]=mapped_column(primary_key=True); reference: Mapped[str]=mapped_column(String(40), unique=True); title: Mapped[str]=mapped_column(String(240)); summary: Mapped[str]=mapped_column(Text); category: Mapped[str]=mapped_column(String(80)); priority: Mapped[str]=mapped_column(String(20), default="Medium"); status: Mapped[str]=mapped_column(String(30), default="Draft"); author_id: Mapped[int]=mapped_column(ForeignKey("users.id")); department_id: Mapped[Optional[int]]=mapped_column(ForeignKey("departments.id")); station_id: Mapped[Optional[int]]=mapped_column(ForeignKey("stations.id"), nullable=True); created_at: Mapped[datetime]=mapped_column(DateTime, default=lambda:datetime.now(timezone.utc)); updated_at: Mapped[datetime]=mapped_column(DateTime, default=lambda:datetime.now(timezone.utc)); decision: Mapped[Optional[str]]=mapped_column(Text, nullable=True); observations: Mapped[Optional[str]]=mapped_column(Text, nullable=True); outcome: Mapped[Optional[str]]=mapped_column(Text, nullable=True)
     documents: Mapped[list["Document"]]=relationship(back_populates="proposal", cascade="all, delete-orphan")
     decision_records: Mapped[list["DecisionRecord"]]=relationship(back_populates="proposal", cascade="all, delete-orphan")
     precedent_visible: Mapped[bool]=mapped_column(default=False, nullable=False)
@@ -83,7 +83,7 @@ class AuditLog(Base):
     __tablename__="audit_logs"; id: Mapped[int]=mapped_column(primary_key=True); user_id: Mapped[Optional[int]]=mapped_column(ForeignKey("users.id"), nullable=True); action: Mapped[str]=mapped_column(String(120)); entity: Mapped[str]=mapped_column(String(50)); entity_id: Mapped[int]=mapped_column(Integer); details: Mapped[str]=mapped_column(Text, default=""); created_at: Mapped[datetime]=mapped_column(DateTime, default=lambda:datetime.now(timezone.utc))
 
 class Login(BaseModel): email:str; password:str
-class ProposalIn(BaseModel): title:str=Field(min_length=3,max_length=240); summary:str=Field(min_length=10); category:str; priority:str="Medium"; department_id:Optional[int]=None
+class ProposalIn(BaseModel): title:str=Field(min_length=3,max_length=240); summary:str=Field(min_length=10); category:str; priority:str="Medium"; department_id:Optional[int]=None; station_id:Optional[int]=None
 class ActionIn(BaseModel): action:str; reason:str=Field(min_length=3)
 class ImplementationIn(BaseModel): progress:int=Field(ge=0,le=100); milestone:str; evidence:str=""
 class UserIn(BaseModel): name:str=Field(min_length=2,max_length=120); email:str; role:str; password:Optional[str]=Field(default=None,min_length=8); department_id:Optional[int]=None; active:bool=True; rank:Optional[str]=None
@@ -91,7 +91,7 @@ class StationIn(BaseModel): code:str=Field(min_length=2,max_length=40); name:str
 class MembershipIn(BaseModel): user_id:int; assignment_role:str="Member"
 class CrossStationRequestIn(BaseModel): source_station_id:int; destination_station_id:int; purpose:str=Field(min_length=5,max_length=4000)
 class CrossStationResponseIn(BaseModel): status:str; shared_information:Optional[str]=Field(default=None,max_length=10000)
-class ProposalUpdate(BaseModel): title:str=Field(min_length=3,max_length=240); summary:str=Field(min_length=10); category:str; priority:str; department_id:Optional[int]=None
+class ProposalUpdate(BaseModel): title:str=Field(min_length=3,max_length=240); summary:str=Field(min_length=10); category:str; priority:str; department_id:Optional[int]=None; station_id:Optional[int]=None
 class AssignmentIn(BaseModel): user_id:int; role:str=Field(min_length=2,max_length=50)
 class PrecedentPreviewIn(BaseModel):
     title:str=Field(min_length=3,max_length=240)
@@ -127,14 +127,15 @@ def allow(*roles):
         return u
     return check
 def can_access_proposal(s, u, p):
-    """Submitters are confined to their own or explicitly assigned records."""
-    if u.role != "Submitter" or u.role == "Admin": return True
+    if u.role == "Admin": return True
+    if not p.station_id or p.station_id not in station_ids_for(s,u): return False
+    if u.role != "Submitter": return True
     return p.author_id == u.id or bool(s.scalar(select(Assignment.id).where(Assignment.proposal_id==p.id, Assignment.user_id==u.id)))
-def visible_to(u):
-    """SQL predicate for listing proposals visible to a submitter."""
-    if u.role == "Submitter":
-        return or_(Proposal.author_id == u.id, Proposal.id.in_(select(Assignment.proposal_id).where(Assignment.user_id == u.id)))
-    return True
+def visible_to(s,u):
+    if u.role == "Admin": return True
+    scope=Proposal.station_id.in_(select(StationMembership.station_id).where(StationMembership.user_id==u.id,StationMembership.active.is_(True)))
+    if u.role == "Submitter": return scope & ((Proposal.author_id==u.id) | Proposal.id.in_(select(Assignment.proposal_id).where(Assignment.user_id==u.id)) | Proposal.precedent_visible.is_(True))
+    return scope
 
 def assignment_allows(s, u, p):
     assignments=list(s.scalars(select(Assignment).where(Assignment.proposal_id==p.id)).all())
@@ -142,7 +143,7 @@ def assignment_allows(s, u, p):
 def decision_record_dict(r):
     return {"id":r.id,"proposal_id":r.proposal_id,"recorded_by_id":r.recorded_by_id,"record_type":r.record_type,"title":r.title,"details":r.details,"reference_number":r.reference_number,"amount":r.amount,"currency":r.currency,"effective_date":r.effective_date,"created_at":r.created_at}
 
-def proposal_dict(p): return {"id":p.id,"reference":p.reference,"title":p.title,"summary":p.summary,"category":p.category,"priority":p.priority,"status":p.status,"created_at":p.created_at,"decision":p.decision,"observations":p.observations,"outcome":p.outcome,"precedent_visible":bool(p.precedent_visible)}
+def proposal_dict(p): return {"id":p.id,"reference":p.reference,"title":p.title,"summary":p.summary,"category":p.category,"priority":p.priority,"status":p.status,"station_id":p.station_id,"created_at":p.created_at,"decision":p.decision,"observations":p.observations,"outcome":p.outcome,"precedent_visible":bool(p.precedent_visible)}
 def user_dict(x): return {"id":x.id,"name":x.name,"email":x.email,"role":x.role,"rank":x.rank,"department_id":x.department_id,"active":x.active}
 def station_dict(x, active_members=0): return {"id":x.id,"code":x.code,"name":x.name,"region":x.region,"station_type":x.station_type,"verified":x.verified,"active":x.active,"active_members":active_members,"capacity":50,"available_slots":max(0,50-active_members),"full":active_members>=50}
 def station_ids_for(s,u): return {x.station_id for x in s.scalars(select(StationMembership).where(StationMembership.user_id==u.id,StationMembership.active.is_(True))).all()}
@@ -265,9 +266,15 @@ def extract_text(raw, content_type):
 
 
 def seed_stations(s):
-    if s.scalar(select(Station.id).limit(1)): return
-    records=[("PY-PDY-CB","Cuddalore Main Police Station","Puducherry","Police Station",False),("PY-PDY-GM","Grand Bazaar Police Station","Puducherry","Police Station",False),("PY-PDY-LW","Lawspet Police Station","Puducherry","Police Station",False),("PY-PDY-OR","Oulgaret Police Station","Puducherry","Police Station",False),("PY-PDY-AR","Ariyankuppam Police Station","Puducherry","Police Station",False),("PY-KAR-KK","Karaikal Town Police Station","Karaikal","Police Station",False),("PY-MAH-MH","Mahe Police Station","Mahe","Police Station",False),("PY-YAN-YN","Yanam Police Station","Yanam","Police Station",False),("PY-PDY-CY","Cyber Crime Police Station","Puducherry","Specialist Unit",False),("PY-PDY-WC","Women Police Station","Puducherry","Specialist Unit",False),("PY-PDY-TR","Traffic Police Unit","Puducherry","Specialist Unit",False),("PY-PDY-OP1","Puducherry Demo Outpost","Puducherry","Outpost",False)]
-    s.add_all([Station(code=c,name=n,region=r,station_type=k,verified=v) for c,n,r,k,v in records]); s.commit()
+    stations=s.scalars(select(Station).order_by(Station.id)).all()
+    if not stations:
+        records=[("PY-PDY-CB","Cuddalore Main Police Station","Puducherry","Police Station",False),("PY-PDY-GM","Grand Bazaar Police Station","Puducherry","Police Station",False),("PY-PDY-LW","Lawspet Police Station","Puducherry","Police Station",False),("PY-PDY-OR","Oulgaret Police Station","Puducherry","Police Station",False),("PY-PDY-AR","Ariyankuppam Police Station","Puducherry","Police Station",False),("PY-KAR-KK","Karaikal Town Police Station","Karaikal","Police Station",False),("PY-MAH-MH","Mahe Police Station","Mahe","Police Station",False),("PY-YAN-YN","Yanam Police Station","Yanam","Police Station",False),("PY-PDY-CY","Cyber Crime Police Station","Puducherry","Specialist Unit",False),("PY-PDY-WC","Women Police Station","Puducherry","Specialist Unit",False),("PY-PDY-TR","Traffic Police Unit","Puducherry","Specialist Unit",False),("PY-PDY-OP1","Puducherry Demo Outpost","Puducherry","Outpost",False)]
+        s.add_all([Station(code=c,name=n,region=r,station_type=k,verified=v) for c,n,r,k,v in records]); s.flush(); stations=s.scalars(select(Station).order_by(Station.id)).all()
+    if APP_ENV != "production" or os.getenv("DEMO_SEED", "false").lower()=="true":
+        default=stations[0]
+        for user in s.scalars(select(User)).all():
+            if not s.scalar(select(StationMembership.id).where(StationMembership.user_id==user.id,StationMembership.active.is_(True))): s.add(StationMembership(station_id=default.id,user_id=user.id,assignment_role="Manager" if user.role=="Admin" else "Member"))
+        s.commit()
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
@@ -275,7 +282,7 @@ async def lifespan(_: FastAPI):
     if APP_ENV != "production": Base.metadata.create_all(engine)
     with SessionLocal() as s:
         if (APP_ENV != "production" or os.getenv("DEMO_SEED", "false").lower() == "true") and not s.scalar(select(User.id).limit(1)): seed(s)
-        if os.getenv("DEMO_SEED", "false").lower() == "true": seed_stations(s)
+        if APP_ENV != "production" or os.getenv("DEMO_SEED", "false").lower() == "true": seed_stations(s)
     yield
 
 allowed_origins=os.getenv("CORS_ORIGINS","http://localhost:5173").split(",")
@@ -308,26 +315,32 @@ def login(body:Login,s:Session=Depends(db)):
 def me(u=Depends(current)): return {"id":u.id,"name":u.name,"email":u.email,"role":u.role}
 @app.get("/dashboard")
 def dashboard(u=Depends(current),s:Session=Depends(db)):
-    scope = visible_to(u)
+    scope = visible_to(s,u)
     total=s.scalar(select(func.count(Proposal.id)).where(scope)) or 0
     rows=s.scalars(select(Proposal).where(scope).order_by(Proposal.updated_at.desc()).limit(6)).all()
     return {"stats":{"total":total,"pending":s.scalar(select(func.count(Proposal.id)).where(scope,Proposal.status.in_(["Submitted","Under Review","Recommended"]))) or 0,"approved":s.scalar(select(func.count(Proposal.id)).where(scope,Proposal.status.in_(["Approved","Implemented","Closed"]))) or 0,"implemented":s.scalar(select(func.count(Proposal.id)).where(scope,Proposal.status.in_(["Implemented","Closed"]))) or 0},"recent":[proposal_dict(x) for x in rows]}
 @app.get("/proposals")
 def proposals(q:str="",status:str="",u=Depends(current),s:Session=Depends(db)):
-    st=select(Proposal).order_by(Proposal.updated_at.desc())
-    if u.role == "Submitter": st=st.where((Proposal.author_id==u.id) | Proposal.id.in_(select(Assignment.proposal_id).where(Assignment.user_id==u.id)))
+    st=select(Proposal).where(visible_to(s,u)).order_by(Proposal.updated_at.desc())
     if q: st=st.where(Proposal.title.ilike(f"%{q}%") | Proposal.reference.ilike(f"%{q}%"))
     if status: st=st.where(Proposal.status==status)
     return [proposal_dict(x) for x in s.scalars(st).all()]
 @app.post("/proposals")
 def create(body:ProposalIn,u=Depends(allow("Admin","Submitter")),s:Session=Depends(db)):
-    p=Proposal(reference=f"IPM-{datetime.now().year}-{(s.scalar(select(func.count(Proposal.id))) or 0)+1:03d}",author_id=u.id,**body.model_dump());s.add(p);s.flush();store_embedding(s,p)
+    station_id=body.station_id
+    authorized=station_ids_for(s,u)
+    if station_id is None and len(authorized)==1: station_id=next(iter(authorized))
+    if station_id is None: raise HTTPException(422,"A station assignment is required")
+    authorized_station(s,u,station_id)
+    values=body.model_dump(); values["station_id"]=station_id
+    p=Proposal(reference=f"IPM-{datetime.now().year}-{(s.scalar(select(func.count(Proposal.id))) or 0)+1:03d}",author_id=u.id,**values);s.add(p);s.flush();store_embedding(s,p)
     audit(s,u,"Created","proposal",p.id);s.commit();return proposal_dict(p)
 @app.put("/proposals/{pid}")
 def update_proposal(pid:int,body:ProposalUpdate,u=Depends(current),s:Session=Depends(db)):
     p=s.get(Proposal,pid)
     if not p: raise HTTPException(404,"Proposal not found")
-    if u.role!="Admin" and p.author_id!=u.id: raise HTTPException(403,"Only the author may edit this proposal")
+    if not can_access_proposal(s,u,p): raise HTTPException(403,"Not authorized for this proposal")
+    if body.station_id is not None and body.station_id != p.station_id: raise HTTPException(403,"Proposal station cannot be changed")
     if p.status not in {"Draft","Modifications Requested"}: raise HTTPException(409,"Only draft or returned proposals can be edited")
     for k,v in body.model_dump().items(): setattr(p,k,v)
     p.updated_at=datetime.now(timezone.utc); store_embedding(s,p); audit(s,u,"Updated","proposal",pid);s.commit();return proposal_dict(p)
@@ -406,16 +419,16 @@ def action(pid:int,body:ActionIn,u=Depends(current),s:Session=Depends(db)):
     p.status=new;p.decision=body.action.title() if body.action in {"approve","reject"} else p.decision;p.observations=body.reason;p.updated_at=datetime.now(timezone.utc);s.add(Review(proposal_id=pid,reviewer_id=u.id,action=body.action,reason=body.reason))
     record_type={"approve":"Decision","reject":"Decision","modifications":"Modification","review":"Observation","recommend":"Observation"}.get(body.action)
     if record_type:
-        p.decision_records.append(DecisionRecord(recorded_by_id=u.id,record_type=record_type,title=f"{new} Ã¢â‚¬â€ {p.reference}",details=body.reason))
+        p.decision_records.append(DecisionRecord(recorded_by_id=u.id,record_type=record_type,title=f"{new} ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â {p.reference}",details=body.reason))
     notify(s,p.author_id,f"{p.reference}: {new}. {body.reason}");store_embedding(s,p);audit(s,u,body.action,"proposal",pid,body.reason);s.commit();return proposal_dict(p)
 def retrieve_precedents(s:Session, query:str, exclude_id:Optional[int]=None, limit:int=10, user=None):
     """Retrieve historical records with role-scoped visibility and an explicit publication boundary."""
     filters=[Proposal.status!="Draft"]
     if exclude_id is not None: filters.append(Proposal.id!=exclude_id)
-    if user is not None and user.role=="Submitter":
-        filters.append(or_(Proposal.author_id==user.id,
-            Proposal.id.in_(select(Assignment.proposal_id).where(Assignment.user_id==user.id)),
-            Proposal.precedent_visible.is_(True)))
+    if user is not None and user.role != "Admin":
+        station_scope=Proposal.station_id.in_(select(StationMembership.station_id).where(StationMembership.user_id==user.id,StationMembership.active.is_(True)))
+        filters.append(station_scope)
+        if user.role=="Submitter": filters.append(or_(Proposal.author_id==user.id, Proposal.id.in_(select(Assignment.proposal_id).where(Assignment.user_id==user.id)), Proposal.precedent_visible.is_(True)))
     candidates=s.scalars(select(Proposal).where(*filters)).all()
     qv=embedding(query)
     if qv and DATABASE_URL.startswith("postgresql"):
@@ -614,7 +627,7 @@ def upload(pid:int,file:UploadFile=File(...),document_type:str=Form("Case File")
 
 @app.get("/documents")
 def documents(q:str="",u=Depends(current),s:Session=Depends(db)):
-    st=select(Document,Proposal).join(Proposal,Document.proposal_id==Proposal.id).where(visible_to(u)).order_by(Document.uploaded_at.desc())
+    st=select(Document,Proposal).join(Proposal,Document.proposal_id==Proposal.id).where(visible_to(s,u)).order_by(Document.uploaded_at.desc())
     if q: st=st.where(Document.filename.ilike(f"%{q}%") | Proposal.reference.ilike(f"%{q}%") | Document.extracted_text.ilike(f"%{q}%"))
     return [{"id":d.id,"filename":d.filename,"document_type":d.document_type,"ocr_status":d.ocr_status,"extracted_text_length":len(d.extracted_text or ""),"reference":p.reference,"proposal_title":p.title,"version":d.version,"uploaded_at":d.uploaded_at,"content_type":d.content_type} for d,p in s.execute(st).all()]
 @app.get("/documents/{did}/download")
@@ -718,7 +731,7 @@ def update_user(uid:int,body:UserIn,u=Depends(allow("Admin")),s:Session=Depends(
 @app.get("/reports/proposals.csv")
 def export_csv(u=Depends(current),s:Session=Depends(db)):
     out=io.StringIO();w=csv.writer(out);w.writerow(["Reference","Title","Category","Priority","Status","Decision","Outcome","Created"])
-    for p in s.scalars(select(Proposal).where(visible_to(u)).order_by(Proposal.created_at.desc())).all():w.writerow([p.reference,p.title,p.category,p.priority,p.status,p.decision or "",p.outcome or "",p.created_at.isoformat()])
+    for p in s.scalars(select(Proposal).where(visible_to(s,u)).order_by(Proposal.created_at.desc())).all():w.writerow([p.reference,p.title,p.category,p.priority,p.status,p.decision or "",p.outcome or "",p.created_at.isoformat()])
     audit(s,u,"Exported","report",0);s.commit();return StreamingResponse(iter([out.getvalue()]),media_type="text/csv",headers={"Content-Disposition":"attachment; filename=ipmprs-proposals.csv"})
 @app.get("/audit")
 def audits(u=Depends(allow("Admin")),s:Session=Depends(db)): return [{"action":x.action,"entity":x.entity,"entity_id":x.entity_id,"details":x.details,"created_at":x.created_at} for x in s.scalars(select(AuditLog).order_by(AuditLog.created_at.desc()).limit(100)).all()]
@@ -732,7 +745,7 @@ class AIQuestion(BaseModel):
 @app.get("/ai/status")
 def ai_status(u=Depends(current)):
     base = os.getenv("AI_BASE_URL", "https://integrate.api.nvidia.com/v1").rstrip("/")
-    local = "localhost" in base or "127.0.0.1" in base or "host.docker.internal" in base
+    local = "localhost" in base or "127.0.0.1" in base or "host.docker.internal" in base or "ollama" in base
     configured = bool(os.getenv("NVIDIA_API_KEY")) or local
     return {"configured": configured, "provider": "local OpenAI-compatible server" if local else "NVIDIA API",
             "model": os.getenv("AI_MODEL", "nvidia/nemotron-3.5-lightning-30b-a3b"),
@@ -766,7 +779,7 @@ def ai_assistant(body: AIQuestion, u=Depends(current), s: Session=Depends(db)):
                      for r in m.get("decision_records", [])[:5]]} for m in matches[:5]]
     base = os.getenv("AI_BASE_URL", "https://integrate.api.nvidia.com/v1").rstrip("/")
     key = os.getenv("NVIDIA_API_KEY", "")
-    local = "localhost" in base or "127.0.0.1" in base or "host.docker.internal" in base
+    local = "localhost" in base or "127.0.0.1" in base or "host.docker.internal" in base or "ollama" in base
     if not key and not local:
         raise HTTPException(503, "AI is not configured. Set NVIDIA_API_KEY for NVIDIA, or set AI_BASE_URL to your local OpenAI-compatible model server.")
     system = ("You are PRAGATI-AI, a police proposal decision-support assistant. Use only the supplied case context "

@@ -228,11 +228,11 @@ def test_submitter_precedent_scope_respects_curated_publication():
             session.add(remote);session.flush()
             private=main_module.Proposal(reference="PRIV-"+token,title="Restricted spectral bridge telemetry",
                 summary="Confidential tungsten relay architecture for limited engineering review.",category="Technology",
-                priority="High",status="Closed",author_id=admin_user.id,department_id=remote.id,
+                priority="High",status="Closed",author_id=admin_user.id,department_id=remote.id,station_id=next(iter(main_module.station_ids_for(session,admin_user))),
                 decision="Approved",observations="Restricted design details.",outcome="Completed",precedent_visible=False)
             published=main_module.Proposal(reference="PUB-"+token,title="Institutional radio equipment modernisation",
                 summary="Cross-department radio equipment modernisation and maintenance planning.",category="Technology",
-                priority="Medium",status="Closed",author_id=admin_user.id,department_id=remote.id,
+                priority="Medium",status="Closed",author_id=admin_user.id,department_id=remote.id,station_id=next(iter(main_module.station_ids_for(session,admin_user))),
                 decision="Approved",observations="Standard procurement controls.",outcome="Maintenance plan delivered.",precedent_visible=True)
             session.add_all([private,published]);session.commit()
             private_id,public_id=private.id,published.id
