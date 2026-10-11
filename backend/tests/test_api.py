@@ -3,7 +3,9 @@ import sys
 from pathlib import Path
 import pytest
 
-os.environ["DATABASE_URL"]="sqlite:///./test_ipmprs.db"
+TEST_DB = Path(__file__).resolve().parent / "test_ipmprs.db"
+if TEST_DB.exists(): TEST_DB.unlink()
+os.environ["DATABASE_URL"]="sqlite:///" + TEST_DB.as_posix()
 from fastapi.testclient import TestClient
 
 # Resolve backend/app regardless of whether pytest is invoked from repo root

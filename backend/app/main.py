@@ -26,7 +26,9 @@ SessionLocal = sessionmaker(engine, expire_on_commit=False)
 # PBKDF2 avoids platform-specific bcrypt binary issues while retaining salted password hashes.
 pwd = CryptContext(schemes=["pbkdf2_sha256"], deprecated="auto")
 security = HTTPBearer()
-ROLES = {"Admin", "Submitter", "Reviewer", "Approving Officer", "Implementation Officer"}
+ROLES = {"Admin", "Submitter", "Reviewer", "Approving Officer", "Implementation Officer", "SI", "Inspector"}
+RANKS = {"SI", "Inspector"}
+STATION_MANAGERS = {"SI", "Inspector"}
 _embedding_model = None
 try:
     from pgvector.sqlalchemy import Vector
@@ -37,8 +39,14 @@ except ImportError:
 class Base(DeclarativeBase): pass
 class Department(Base):
     __tablename__="departments"; id: Mapped[int]=mapped_column(primary_key=True); name: Mapped[str]=mapped_column(String(120), unique=True)
+class Station(Base):
+    __tablename__="stations"; id: Mapped[int]=mapped_column(primary_key=True); code: Mapped[str]=mapped_column(String(40), unique=True, nullable=False); name: Mapped[str]=mapped_column(String(160), nullable=False); region: Mapped[str]=mapped_column(String(40), nullable=False); station_type: Mapped[str]=mapped_column(String(40), nullable=False, default="Police Station"); verified: Mapped[bool]=mapped_column(default=False, nullable=False); active: Mapped[bool]=mapped_column(default=True, nullable=False)
+class StationMembership(Base):
+    __tablename__="station_memberships"; id: Mapped[int]=mapped_column(primary_key=True); station_id: Mapped[int]=mapped_column(ForeignKey("stations.id"), nullable=False); user_id: Mapped[int]=mapped_column(ForeignKey("users.id"), nullable=False); assignment_role: Mapped[str]=mapped_column(String(30), nullable=False, default="Member"); active: Mapped[bool]=mapped_column(default=True, nullable=False); assigned_at: Mapped[datetime]=mapped_column(DateTime, default=lambda:datetime.now(timezone.utc)); deactivated_at: Mapped[Optional[datetime]]=mapped_column(DateTime, nullable=True)
+class CrossStationRequest(Base):
+    __tablename__="cross_station_requests"; id: Mapped[int]=mapped_column(primary_key=True); request_reference: Mapped[str]=mapped_column(String(50), unique=True, nullable=False); source_station_id: Mapped[int]=mapped_column(ForeignKey("stations.id"), nullable=False); destination_station_id: Mapped[int]=mapped_column(ForeignKey("stations.id"), nullable=False); requested_by_id: Mapped[int]=mapped_column(ForeignKey("users.id"), nullable=False); responded_by_id: Mapped[Optional[int]]=mapped_column(ForeignKey("users.id"), nullable=True); purpose: Mapped[str]=mapped_column(Text, nullable=False); shared_information: Mapped[Optional[str]]=mapped_column(Text, nullable=True); status: Mapped[str]=mapped_column(String(20), default="Pending", nullable=False); created_at: Mapped[datetime]=mapped_column(DateTime, default=lambda:datetime.now(timezone.utc)); responded_at: Mapped[Optional[datetime]]=mapped_column(DateTime, nullable=True)
 class User(Base):
-    __tablename__="users"; id: Mapped[int]=mapped_column(primary_key=True); name: Mapped[str]=mapped_column(String(120)); email: Mapped[str]=mapped_column(String(180), unique=True); password_hash: Mapped[str]=mapped_column(String(255)); role: Mapped[str]=mapped_column(String(40)); department_id: Mapped[Optional[int]]=mapped_column(ForeignKey("departments.id"), nullable=True); active: Mapped[bool]=mapped_column(default=True)
+    __tablename__="users"; id: Mapped[int]=mapped_column(primary_key=True); name: Mapped[str]=mapped_column(String(120)); email: Mapped[str]=mapped_column(String(180), unique=True); password_hash: Mapped[str]=mapped_column(String(255)); role: Mapped[str]=mapped_column(String(40)); rank: Mapped[Optional[str]]=mapped_column(String(30), nullable=True); department_id: Mapped[Optional[int]]=mapped_column(ForeignKey("departments.id"), nullable=True); active: Mapped[bool]=mapped_column(default=True)
 class Proposal(Base):
     __tablename__="proposals"; id: Mapped[int]=mapped_column(primary_key=True); reference: Mapped[str]=mapped_column(String(40), unique=True); title: Mapped[str]=mapped_column(String(240)); summary: Mapped[str]=mapped_column(Text); category: Mapped[str]=mapped_column(String(80)); priority: Mapped[str]=mapped_column(String(20), default="Medium"); status: Mapped[str]=mapped_column(String(30), default="Draft"); author_id: Mapped[int]=mapped_column(ForeignKey("users.id")); department_id: Mapped[Optional[int]]=mapped_column(ForeignKey("departments.id")); created_at: Mapped[datetime]=mapped_column(DateTime, default=lambda:datetime.now(timezone.utc)); updated_at: Mapped[datetime]=mapped_column(DateTime, default=lambda:datetime.now(timezone.utc)); decision: Mapped[Optional[str]]=mapped_column(Text, nullable=True); observations: Mapped[Optional[str]]=mapped_column(Text, nullable=True); outcome: Mapped[Optional[str]]=mapped_column(Text, nullable=True)
     documents: Mapped[list["Document"]]=relationship(back_populates="proposal", cascade="all, delete-orphan")
@@ -78,7 +86,11 @@ class Login(BaseModel): email:str; password:str
 class ProposalIn(BaseModel): title:str=Field(min_length=3,max_length=240); summary:str=Field(min_length=10); category:str; priority:str="Medium"; department_id:Optional[int]=None
 class ActionIn(BaseModel): action:str; reason:str=Field(min_length=3)
 class ImplementationIn(BaseModel): progress:int=Field(ge=0,le=100); milestone:str; evidence:str=""
-class UserIn(BaseModel): name:str=Field(min_length=2,max_length=120); email:str; role:str; password:Optional[str]=Field(default=None,min_length=8); department_id:Optional[int]=None; active:bool=True
+class UserIn(BaseModel): name:str=Field(min_length=2,max_length=120); email:str; role:str; password:Optional[str]=Field(default=None,min_length=8); department_id:Optional[int]=None; active:bool=True; rank:Optional[str]=None
+class StationIn(BaseModel): code:str=Field(min_length=2,max_length=40); name:str=Field(min_length=2,max_length=160); region:str=Field(min_length=2,max_length=40); station_type:str="Police Station"; verified:bool=False; active:bool=True
+class MembershipIn(BaseModel): user_id:int; assignment_role:str="Member"
+class CrossStationRequestIn(BaseModel): source_station_id:int; destination_station_id:int; purpose:str=Field(min_length=5,max_length=4000)
+class CrossStationResponseIn(BaseModel): status:str; shared_information:Optional[str]=Field(default=None,max_length=10000)
 class ProposalUpdate(BaseModel): title:str=Field(min_length=3,max_length=240); summary:str=Field(min_length=10); category:str; priority:str; department_id:Optional[int]=None
 class AssignmentIn(BaseModel): user_id:int; role:str=Field(min_length=2,max_length=50)
 class PrecedentPreviewIn(BaseModel):
@@ -131,7 +143,15 @@ def decision_record_dict(r):
     return {"id":r.id,"proposal_id":r.proposal_id,"recorded_by_id":r.recorded_by_id,"record_type":r.record_type,"title":r.title,"details":r.details,"reference_number":r.reference_number,"amount":r.amount,"currency":r.currency,"effective_date":r.effective_date,"created_at":r.created_at}
 
 def proposal_dict(p): return {"id":p.id,"reference":p.reference,"title":p.title,"summary":p.summary,"category":p.category,"priority":p.priority,"status":p.status,"created_at":p.created_at,"decision":p.decision,"observations":p.observations,"outcome":p.outcome,"precedent_visible":bool(p.precedent_visible)}
-def user_dict(x): return {"id":x.id,"name":x.name,"email":x.email,"role":x.role,"department_id":x.department_id,"active":x.active}
+def user_dict(x): return {"id":x.id,"name":x.name,"email":x.email,"role":x.role,"rank":x.rank,"department_id":x.department_id,"active":x.active}
+def station_dict(x, active_members=0): return {"id":x.id,"code":x.code,"name":x.name,"region":x.region,"station_type":x.station_type,"verified":x.verified,"active":x.active,"active_members":active_members,"capacity":50,"available_slots":max(0,50-active_members),"full":active_members>=50}
+def station_ids_for(s,u): return {x.station_id for x in s.scalars(select(StationMembership).where(StationMembership.user_id==u.id,StationMembership.active.is_(True))).all()}
+def active_member_count(s,station_id): return int(s.scalar(select(func.count(StationMembership.id)).where(StationMembership.station_id==station_id,StationMembership.active.is_(True))) or 0)
+def authorized_station(s,u,station_id,manager=False):
+    if u.role=="Admin": return True
+    membership=s.scalar(select(StationMembership).where(StationMembership.station_id==station_id,StationMembership.user_id==u.id,StationMembership.active.is_(True)))
+    if not membership or (manager and u.rank not in STATION_MANAGERS): raise HTTPException(403,"You are not authorized for this station")
+    return True
 def words(t): return set(re.findall(r"[a-z]{3,}",t.lower()))
 def score(query, p):
     """Explainable lexical fallback including structured decisions, sanctions and extracted case-file text."""
@@ -244,12 +264,18 @@ def extract_text(raw, content_type):
     return extract_document_text(raw, content_type)[0]
 
 
+def seed_stations(s):
+    if s.scalar(select(Station.id).limit(1)): return
+    records=[("PY-PDY-CB","Cuddalore Main Police Station","Puducherry","Police Station",False),("PY-PDY-GM","Grand Bazaar Police Station","Puducherry","Police Station",False),("PY-PDY-LW","Lawspet Police Station","Puducherry","Police Station",False),("PY-PDY-OR","Oulgaret Police Station","Puducherry","Police Station",False),("PY-PDY-AR","Ariyankuppam Police Station","Puducherry","Police Station",False),("PY-KAR-KK","Karaikal Town Police Station","Karaikal","Police Station",False),("PY-MAH-MH","Mahe Police Station","Mahe","Police Station",False),("PY-YAN-YN","Yanam Police Station","Yanam","Police Station",False),("PY-PDY-CY","Cyber Crime Police Station","Puducherry","Specialist Unit",False),("PY-PDY-WC","Women Police Station","Puducherry","Specialist Unit",False),("PY-PDY-TR","Traffic Police Unit","Puducherry","Specialist Unit",False),("PY-PDY-OP1","Puducherry Demo Outpost","Puducherry","Outpost",False)]
+    s.add_all([Station(code=c,name=n,region=r,station_type=k,verified=v) for c,n,r,k,v in records]); s.commit()
+
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     """Development/test schema bootstrap; production is migrated by Alembic."""
     if APP_ENV != "production": Base.metadata.create_all(engine)
     with SessionLocal() as s:
         if (APP_ENV != "production" or os.getenv("DEMO_SEED", "false").lower() == "true") and not s.scalar(select(User.id).limit(1)): seed(s)
+        if os.getenv("DEMO_SEED", "false").lower() == "true": seed_stations(s)
     yield
 
 allowed_origins=os.getenv("CORS_ORIGINS","http://localhost:5173").split(",")
@@ -380,7 +406,7 @@ def action(pid:int,body:ActionIn,u=Depends(current),s:Session=Depends(db)):
     p.status=new;p.decision=body.action.title() if body.action in {"approve","reject"} else p.decision;p.observations=body.reason;p.updated_at=datetime.now(timezone.utc);s.add(Review(proposal_id=pid,reviewer_id=u.id,action=body.action,reason=body.reason))
     record_type={"approve":"Decision","reject":"Decision","modifications":"Modification","review":"Observation","recommend":"Observation"}.get(body.action)
     if record_type:
-        p.decision_records.append(DecisionRecord(recorded_by_id=u.id,record_type=record_type,title=f"{new} — {p.reference}",details=body.reason))
+        p.decision_records.append(DecisionRecord(recorded_by_id=u.id,record_type=record_type,title=f"{new} Ã¢â‚¬â€ {p.reference}",details=body.reason))
     notify(s,p.author_id,f"{p.reference}: {new}. {body.reason}");store_embedding(s,p);audit(s,u,body.action,"proposal",pid,body.reason);s.commit();return proposal_dict(p)
 def retrieve_precedents(s:Session, query:str, exclude_id:Optional[int]=None, limit:int=10, user=None):
     """Retrieve historical records with role-scoped visibility and an explicit publication boundary."""
@@ -618,21 +644,75 @@ def read_notification(nid:int,u=Depends(current),s:Session=Depends(db)):
     n=s.get(Notification,nid)
     if not n or n.user_id!=u.id: raise HTTPException(404,"Notification not found")
     n.read=True;s.commit();return {"ok":True}
+@app.get("/stations")
+def stations(u=Depends(current),s:Session=Depends(db)):
+    rows=s.scalars(select(Station).where(Station.active.is_(True)).order_by(Station.region,Station.name)).all()
+    return [station_dict(x,active_member_count(s,x.id)) for x in rows]
+@app.post("/stations")
+def create_station(body:StationIn,u=Depends(allow("Admin")),s:Session=Depends(db)):
+    if s.scalar(select(Station).where(Station.code==body.code)): raise HTTPException(409,"Station code already exists")
+    x=Station(**body.model_dump()); s.add(x); s.flush(); audit(s,u,"Created","station",x.id,body.code); s.commit(); return station_dict(x)
+@app.get("/stations/{station_id}/members")
+def station_members(station_id:int,u=Depends(current),s:Session=Depends(db)):
+    authorized_station(s,u,station_id)
+    if not s.get(Station,station_id): raise HTTPException(404,"Station not found")
+    rows=s.execute(select(StationMembership,User).join(User,User.id==StationMembership.user_id).where(StationMembership.station_id==station_id,StationMembership.active.is_(True)).order_by(User.name)).all()
+    return {"station_id":station_id,"capacity":50,"active_members":len(rows),"available_slots":50-len(rows),"members":[{"id":m.id,"user_id":x.id,"name":x.name,"email":x.email,"rank":x.rank,"role":x.role,"assignment_role":m.assignment_role,"assigned_at":m.assigned_at} for m,x in rows]}
+@app.post("/stations/{station_id}/members")
+def add_station_member(station_id:int,body:MembershipIn,u=Depends(current),s:Session=Depends(db)):
+    authorized_station(s,u,station_id,manager=True)
+    station=s.scalar(select(Station).where(Station.id==station_id).with_for_update())
+    user=s.get(User,body.user_id)
+    if not station or not station.active: raise HTTPException(404,"Station not found")
+    if not user or not user.active: raise HTTPException(404,"Active user not found")
+    existing=s.scalar(select(StationMembership).where(StationMembership.station_id==station_id,StationMembership.user_id==body.user_id,StationMembership.active.is_(True)))
+    if existing: raise HTTPException(409,"User is already an active member of this station")
+    count=active_member_count(s,station_id)
+    if count>=50: raise HTTPException(409,"This station has reached its limit of 50 active members")
+    m=StationMembership(station_id=station_id,user_id=body.user_id,assignment_role=body.assignment_role); s.add(m); s.flush(); audit(s,u,"Assigned station member","station_membership",m.id,f"station={station.code}; user={user.id}"); s.commit(); return {"id":m.id,"station_id":station_id,"user_id":user.id,"active_members":count+1,"available_slots":49-count}
+@app.delete("/stations/{station_id}/members/{membership_id}")
+def deactivate_station_member(station_id:int,membership_id:int,u=Depends(current),s:Session=Depends(db)):
+    authorized_station(s,u,station_id,manager=True); m=s.scalar(select(StationMembership).where(StationMembership.id==membership_id,StationMembership.station_id==station_id,StationMembership.active.is_(True)))
+    if not m: raise HTTPException(404,"Active membership not found")
+    m.active=False; m.deactivated_at=datetime.now(timezone.utc); audit(s,u,"Deactivated station member","station_membership",m.id); s.commit(); return {"ok":True,"active_members":active_member_count(s,station_id),"available_slots":50-active_member_count(s,station_id)}
+@app.get("/cross-station/requests")
+def list_cross_station_requests(u=Depends(current),s:Session=Depends(db)):
+    own=station_ids_for(s,u)
+    rows=s.scalars(select(CrossStationRequest).where(or_(CrossStationRequest.requested_by_id==u.id,CrossStationRequest.source_station_id.in_(own),CrossStationRequest.destination_station_id.in_(own))).order_by(CrossStationRequest.created_at.desc())).all()
+    return [{"id":x.id,"reference":x.request_reference,"source_station_id":x.source_station_id,"destination_station_id":x.destination_station_id,"requested_by_id":x.requested_by_id,"status":x.status,"purpose":x.purpose,"shared_information":x.shared_information,"created_at":x.created_at,"responded_at":x.responded_at} for x in rows]
+@app.post("/cross-station/requests")
+def create_cross_station_request(body:CrossStationRequestIn,u=Depends(current),s:Session=Depends(db)):
+    if body.source_station_id==body.destination_station_id: raise HTTPException(422,"Source and destination stations must differ")
+    authorized_station(s,u,body.source_station_id,manager=True)
+    if not s.scalar(select(Station).where(Station.id==body.destination_station_id,Station.active.is_(True))): raise HTTPException(404,"Destination station not found")
+    ref=f"CSR-{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}-{u.id}"
+    x=CrossStationRequest(request_reference=ref,source_station_id=body.source_station_id,destination_station_id=body.destination_station_id,requested_by_id=u.id,purpose=body.purpose.strip()); s.add(x); s.flush(); audit(s,u,"Created cross-station request","cross_station_request",x.id,f"destination={body.destination_station_id}"); s.commit(); return {"id":x.id,"reference":x.request_reference,"status":x.status}
+@app.post("/cross-station/requests/{request_id}/respond")
+def respond_cross_station_request(request_id:int,body:CrossStationResponseIn,u=Depends(current),s:Session=Depends(db)):
+    x=s.get(CrossStationRequest,request_id)
+    if not x: raise HTTPException(404,"Request not found")
+    authorized_station(s,u,x.destination_station_id,manager=True)
+    if body.status not in {"Approved","Declined"}: raise HTTPException(422,"Status must be Approved or Declined")
+    if x.status!="Pending": raise HTTPException(409,"Request has already been answered")
+    x.status=body.status; x.shared_information=body.shared_information; x.responded_by_id=u.id; x.responded_at=datetime.now(timezone.utc); audit(s,u,"Responded to cross-station request","cross_station_request",x.id,body.status); s.commit(); return {"id":x.id,"status":x.status,"shared_information":x.shared_information}
+
 @app.get("/users")
 def users(u=Depends(allow("Admin")),s:Session=Depends(db)): return [user_dict(x) for x in s.scalars(select(User).order_by(User.name)).all()]
 @app.post("/users")
 def create_user(body:UserIn,u=Depends(allow("Admin")),s:Session=Depends(db)):
     if body.role not in ROLES: raise HTTPException(422,"Unknown role")
+    if body.rank not in RANKS and body.rank is not None: raise HTTPException(422,"Rank must be SI or Inspector")
     if s.scalar(select(User).where(User.email==body.email)): raise HTTPException(409,"Email already exists")
     if not body.password: raise HTTPException(422,"A password is required")
-    x=User(name=body.name,email=body.email,role=body.role,password_hash=pwd.hash(body.password),department_id=body.department_id,active=body.active);s.add(x);s.flush();audit(s,u,"Created","user",x.id);s.commit();return user_dict(x)
+    x=User(name=body.name,email=body.email,role=body.role,rank=body.rank,password_hash=pwd.hash(body.password),department_id=body.department_id,active=body.active);s.add(x);s.flush();audit(s,u,"Created","user",x.id);s.commit();return user_dict(x)
 @app.put("/users/{uid}")
 def update_user(uid:int,body:UserIn,u=Depends(allow("Admin")),s:Session=Depends(db)):
     x=s.get(User,uid)
     if not x: raise HTTPException(404,"User not found")
     if body.role not in ROLES: raise HTTPException(422,"Unknown role")
+    if body.rank not in RANKS and body.rank is not None: raise HTTPException(422,"Rank must be SI or Inspector")
     if uid==u.id and not body.active: raise HTTPException(409,"You cannot deactivate your own account")
-    x.name,x.email,x.role,x.department_id,x.active=body.name,body.email,body.role,body.department_id,body.active
+    x.name,x.email,x.role,x.rank,x.department_id,x.active=body.name,body.email,body.role,body.rank,body.department_id,body.active
     if body.password:x.password_hash=pwd.hash(body.password)
     audit(s,u,"Updated","user",uid);s.commit();return user_dict(x)
 @app.get("/reports/proposals.csv")
