@@ -78,7 +78,6 @@ Tests cover login/dashboard and the four-role path: create → submit → review
 
 For public deployment, add TLS termination, malware scanning/object storage for documents, monitoring, rate limiting, managed secret storage, scheduled backup/restore drills, and an independent security assessment.
 
-
 ## Digitize case files (OCR)
 
 - Attach PDF, DOCX, TXT, or photo/scan formats JPG/JPEG, PNG, WEBP, TIFF and BMP from a proposal. Upload limit is 10 MB.
@@ -90,13 +89,11 @@ For public deployment, add TLS termination, malware scanning/object storage for 
 - Migration 0002_document_blob_and_ocr.py adds database binary storage and OCR metadata to existing installs. Back up the database before schema changes.
 - The API test suite includes an upload, OCR-text-search, database-backed download, and document visibility test; OCR is mocked in tests so a local Tesseract binary is not required.
 
-
 ## Precedent Impact & Risk Intelligence
 
 The proposal editor has a pre-submission precedent check, and every proposal detail page shows an evidence brief before review/approval. It compares positive and adverse historical records, flags contradictory precedent, lists recurring concerns from recorded observations/reviews, highlights missing recorded outcomes, and presents checks for the authorised officer. These are transparent heuristic screening cues, not a calibrated risk probability or an automatic approval/rejection decision.
 
 Existing or imported proposals can be batch-indexed by an Admin from Precedent Search using the Reindex historical archive button. It embeds title, summary, category, decision, observations, outcomes and extracted document text. Newly created proposals, workflow decisions and implementation updates also refresh their embedding. If the local Sentence Transformers model cannot be downloaded/loaded, precedent retrieval uses a labelled lexical fallback.
-
 
 ## Structured decision and sanction history
 
@@ -107,11 +104,36 @@ Existing or imported proposals can be batch-indexed by an Admin from Precedent S
 - New-proposal precedent suggestions refresh automatically while the title, summary, category or priority is edited (debounced to avoid sending a request for every keystroke). Proposal detail pages load the impact brief automatically.
 - Migration 0003_structured_decisions.py adds the structured records table and curated-publication flag to existing databases.
 
-
 ## PRAGATI-AI model assistant
 
 The AI Assistant page connects the existing proposal and precedent workflow to an OpenAI-compatible model endpoint. It retrieves only historical proposals visible to the signed-in user's role, includes reference-backed evidence in the prompt, shows retrieved sources, and logs assistant use without logging the user's full question. AI answers are advisory; officers must verify source records and make all decisions.
 
-Configure `AI_BASE_URL`, `AI_MODEL` and `NVIDIA_API_KEY` in `.env` for NVIDIA's hosted API. Do not commit a real API key. Because the key previously pasted into chat may be compromised, revoke it and create a new one before configuring the environment. To use a local llama.cpp server instead, set `AI_BASE_URL=http://host.docker.internal:8081/v1`, leave `NVIDIA_API_KEY` blank, and run the local model server on port 8081. Restart Docker Compose after changing environment settings. The `/ai/status` endpoint reports whether the model endpoint is configured; it does not guarantee the remote model is reachable.
+The default configuration uses NVIDIA's hosted API. Configure `AI_BASE_URL`, `AI_MODEL` and `NVIDIA_API_KEY` in `.env`. Do not commit a real API key. Because the key previously pasted into chat may be compromised, revoke it and create a new one before configuring the environment. The `/ai/status` endpoint reports whether the model endpoint is configured; it does not guarantee the remote model is reachable.
 
-The assistant currently grounds responses in proposal summaries, recorded decisions/observations/outcomes and retrieved precedent excerpts. It does not yet run geospatial hotspot algorithms or replace the existing pgvector retrieval. Hotspot analysis requires actual coordinate/time fields and a validated geospatial pipeline. Do not send confidential police records to a hosted model unless your organisation has approved that data processing.
+### Local model using Docker (recommended for prototype testing with synthetic data)
+
+An optional Compose override is provided in `docker-compose.local-ai.yml`. It runs Ollama in a separate container, downloads `qwen2.5:7b` into a persistent Docker volume, and points the PRAGATI-AI backend to the local OpenAI-compatible endpoint. The model download is several GB; first startup can take a while.
+
+```powershell
+docker compose -f docker-compose.yml -f docker-compose.local-ai.yml up --build -d
+docker compose -f docker-compose.yml -f docker-compose.local-ai.yml ps
+```
+
+Open `http://localhost:5173`, sign in with a configured test account, and try AI Assistant. To see the model download/init logs, run:
+
+```powershell
+docker compose -f docker-compose.yml -f docker-compose.local-ai.yml logs -f ollama-init
+```
+
+Use only one local Ollama server on host port 11434; if that port is already occupied, stop the other service before starting this stack. The containerized model may run on CPU unless Docker Desktop's NVIDIA GPU access is explicitly configured and verified; expect slower responses on CPU. Model quality and Tamil-language performance must be evaluated on representative, approved sample documents.
+
+### Target architecture for a police deployment
+
+- **Web UI:** authenticated React portal with role-scoped workflows.
+- **API:** FastAPI enforces permissions and performs all retrieval; the model never decides which records a user may access.
+- **Data:** PostgreSQL + pgvector for proposals, structured decisions, audit records and embeddings; controlled document storage with encryption and retention policy.
+- **Retrieval:** existing local `all-MiniLM-L6-v2` embeddings plus keyword fallback, filtered by user permissions and institutional publication rules.
+- **Generation:** an approved local/on-premises model endpoint (Qwen2.5 7B is a prototype baseline, not a validated production model).
+- **Governance:** source references, human review, auditability, backups, access reviews, redaction, security testing and documented retention/deletion.
+
+This local model setup is for prototype evaluation, not an approved Puducherry Police production deployment. Do not import confidential police records or connect departmental systems until the department authorises the data handling, hosting, model, identity integration and security controls. The assistant does not yet run geospatial hotspot algorithms or replace existing pgvector retrieval. Hotspot analysis requires actual coordinate/time fields and a validated geospatial pipeline.
