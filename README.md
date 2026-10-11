@@ -106,3 +106,12 @@ Existing or imported proposals can be batch-indexed by an Admin from Precedent S
 - Admins/Approving Officers can explicitly publish a reviewed or completed proposal to the institutional precedent catalogue. Submitter searches include their own/assigned records plus published institutional precedents; reviewer and decision roles can search across departments according to their role.
 - New-proposal precedent suggestions refresh automatically while the title, summary, category or priority is edited (debounced to avoid sending a request for every keystroke). Proposal detail pages load the impact brief automatically.
 - Migration 0003_structured_decisions.py adds the structured records table and curated-publication flag to existing databases.
+
+
+## PRAGATI-AI model assistant
+
+The AI Assistant page connects the existing proposal and precedent workflow to an OpenAI-compatible model endpoint. It retrieves only historical proposals visible to the signed-in user's role, includes reference-backed evidence in the prompt, shows retrieved sources, and logs assistant use without logging the user's full question. AI answers are advisory; officers must verify source records and make all decisions.
+
+Configure `AI_BASE_URL`, `AI_MODEL` and `NVIDIA_API_KEY` in `.env` for NVIDIA's hosted API. Do not commit a real API key. Because the key previously pasted into chat may be compromised, revoke it and create a new one before configuring the environment. To use a local llama.cpp server instead, set `AI_BASE_URL=http://host.docker.internal:8081/v1`, leave `NVIDIA_API_KEY` blank, and run the local model server on port 8081. Restart Docker Compose after changing environment settings. The `/ai/status` endpoint reports whether the model endpoint is configured; it does not guarantee the remote model is reachable.
+
+The assistant currently grounds responses in proposal summaries, recorded decisions/observations/outcomes and retrieved precedent excerpts. It does not yet run geospatial hotspot algorithms or replace the existing pgvector retrieval. Hotspot analysis requires actual coordinate/time fields and a validated geospatial pipeline. Do not send confidential police records to a hosted model unless your organisation has approved that data processing.
