@@ -20,7 +20,7 @@ services:
       SECRET_KEY: ${SECRET_KEY:?Set SECRET_KEY in .env}
       CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:5173}
       UPLOAD_DIR: /data/uploads
-      DEMO_SEED: ${DEMO_SEED:-false}
+      DEMO_SEED: ${DEMO_SEED:-true}
       AI_BASE_URL: ${AI_BASE_URL:-https://integrate.api.nvidia.com/v1}
       AI_MODEL: ${AI_MODEL:-nvidia/nemotron-3.5-lightning-30b-a3b}
       NVIDIA_API_KEY: ${NVIDIA_API_KEY:-}
