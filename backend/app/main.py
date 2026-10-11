@@ -54,6 +54,8 @@ class User(Base):
     __tablename__="users"; id: Mapped[int]=mapped_column(primary_key=True); name: Mapped[str]=mapped_column(String(120)); email: Mapped[str]=mapped_column(String(180), unique=True); password_hash: Mapped[str]=mapped_column(String(255)); role: Mapped[str]=mapped_column(String(40)); rank: Mapped[Optional[str]]=mapped_column(String(30), nullable=True); department_id: Mapped[Optional[int]]=mapped_column(ForeignKey("departments.id"), nullable=True); active: Mapped[bool]=mapped_column(default=True); email_verified: Mapped[bool]=mapped_column(default=False, nullable=False); activation_required: Mapped[bool]=mapped_column(default=True, nullable=False)
 class OTPChallenge(Base):
     __tablename__="otp_challenges"; id: Mapped[int]=mapped_column(primary_key=True); user_id: Mapped[int]=mapped_column(ForeignKey("users.id"), nullable=False); code_hash: Mapped[str]=mapped_column(String(128), nullable=False); expires_at: Mapped[datetime]=mapped_column(DateTime, nullable=False); attempts: Mapped[int]=mapped_column(Integer, default=0, nullable=False); consumed: Mapped[bool]=mapped_column(default=False, nullable=False); created_at: Mapped[datetime]=mapped_column(DateTime, default=lambda:datetime.now(timezone.utc))
+class ActivationToken(Base):
+    __tablename__="activation_tokens"; id: Mapped[int]=mapped_column(primary_key=True); user_id: Mapped[int]=mapped_column(ForeignKey("users.id"), nullable=False); station_id: Mapped[int]=mapped_column(ForeignKey("stations.id"), nullable=False); token_hash: Mapped[str]=mapped_column(String(128), unique=True, nullable=False); expires_at: Mapped[datetime]=mapped_column(DateTime, nullable=False); used: Mapped[bool]=mapped_column(default=False, nullable=False); created_at: Mapped[datetime]=mapped_column(DateTime, default=lambda:datetime.now(timezone.utc))
 class Proposal(Base):
     __tablename__="proposals"; id: Mapped[int]=mapped_column(primary_key=True); reference: Mapped[str]=mapped_column(String(40), unique=True); title: Mapped[str]=mapped_column(String(240)); summary: Mapped[str]=mapped_column(Text); category: Mapped[str]=mapped_column(String(80)); priority: Mapped[str]=mapped_column(String(20), default="Medium"); status: Mapped[str]=mapped_column(String(30), default="Draft"); author_id: Mapped[int]=mapped_column(ForeignKey("users.id")); department_id: Mapped[Optional[int]]=mapped_column(ForeignKey("departments.id")); station_id: Mapped[Optional[int]]=mapped_column(ForeignKey("stations.id"), nullable=True); created_at: Mapped[datetime]=mapped_column(DateTime, default=lambda:datetime.now(timezone.utc)); updated_at: Mapped[datetime]=mapped_column(DateTime, default=lambda:datetime.now(timezone.utc)); decision: Mapped[Optional[str]]=mapped_column(Text, nullable=True); observations: Mapped[Optional[str]]=mapped_column(Text, nullable=True); outcome: Mapped[Optional[str]]=mapped_column(Text, nullable=True)
     documents: Mapped[list["Document"]]=relationship(back_populates="proposal", cascade="all, delete-orphan")
@@ -94,6 +96,8 @@ class OTPVerify(BaseModel): challenge_id:int; code:str=Field(min_length=6,max_le
 class ProposalIn(BaseModel): title:str=Field(min_length=3,max_length=240); summary:str=Field(min_length=10); category:str; priority:str="Medium"; department_id:Optional[int]=None; station_id:Optional[int]=None
 class ActionIn(BaseModel): action:str; reason:str=Field(min_length=3)
 class ImplementationIn(BaseModel): progress:int=Field(ge=0,le=100); milestone:str; evidence:str=""
+class ActivationIn(BaseModel): token:str=Field(min_length=32,max_length=128); password:str=Field(min_length=12,max_length=200)
+class ProvisionIn(BaseModel): name:str=Field(min_length=2,max_length=120); email:str; rank:str; station_id:int; department_id:Optional[int]=None
 class UserIn(BaseModel): name:str=Field(min_length=2,max_length=120); email:str; role:str; password:Optional[str]=Field(default=None,min_length=8); department_id:Optional[int]=None; active:bool=True; rank:Optional[str]=None
 class StationIn(BaseModel): code:str=Field(min_length=2,max_length=40); name:str=Field(min_length=2,max_length=160); region:str=Field(min_length=2,max_length=40); station_type:str="Police Station"; verified:bool=False; active:bool=True
 class MembershipIn(BaseModel): user_id:int; assignment_role:str="Member"
@@ -126,6 +130,16 @@ def token_for(u): return jwt.encode({"sub":str(u.id),"role":u.role,"exp":datetim
 def utc_now(value):
     return value.replace(tzinfo=timezone.utc) if value and value.tzinfo is None else value
 def needs_otp(u): return APP_ENV == "production" and (u.rank in PRIVILEGED_RANKS or u.role in {"Admin", "Inspector", "SI", "SHO"})
+def send_activation(email, token):
+    host=os.getenv("SMTP_HOST")
+    if not host: raise HTTPException(503,"Activation delivery is not configured")
+    msg=EmailMessage(); msg["Subject"]="PRAGATI-AI account activation"; msg["From"]=os.getenv("SMTP_FROM", "no-reply@localhost"); msg["To"]=email; msg.set_content("Use this one-time activation token to set your password: "+token)
+    with smtplib.SMTP(host,int(os.getenv("SMTP_PORT","587")),timeout=10) as smtp:
+        if os.getenv("SMTP_STARTTLS","true").lower()=="true": smtp.starttls()
+        username=os.getenv("SMTP_USERNAME"); password=os.getenv("SMTP_PASSWORD")
+        if username: smtp.login(username,password or "")
+        smtp.send_message(msg)
+
 def send_otp(email, code):
     host=os.getenv("SMTP_HOST")
     if not host: raise HTTPException(503,"Email OTP delivery is not configured")
@@ -748,6 +762,30 @@ def respond_cross_station_request(request_id:int,body:CrossStationResponseIn,u=D
     if body.status not in {"Approved","Declined"}: raise HTTPException(422,"Status must be Approved or Declined")
     if x.status!="Pending": raise HTTPException(409,"Request has already been answered")
     x.status=body.status; x.shared_information=body.shared_information; x.responded_by_id=u.id; x.responded_at=datetime.now(timezone.utc); audit(s,u,"Responded to cross-station request","cross_station_request",x.id,body.status); s.commit(); return {"id":x.id,"status":x.status,"shared_information":x.shared_information}
+
+@app.post("/admin/provision")
+def provision(body:ProvisionIn,u=Depends(allow("Admin")),s:Session=Depends(db)):
+    if body.rank not in RANKS: raise HTTPException(422,"Unknown police rank")
+    station=s.scalar(select(Station).where(Station.id==body.station_id,Station.active.is_(True)).with_for_update())
+    if not station: raise HTTPException(404,"Station not found")
+    if s.scalar(select(User.id).where(User.email==body.email)): raise HTTPException(409,"Email already exists")
+    if active_member_count(s,body.station_id)>=50: raise HTTPException(409,"This station has reached its limit of 50 active members")
+    raw=secrets.token_urlsafe(48); now=datetime.now(timezone.utc)
+    account=User(name=body.name,email=body.email,role=body.rank,rank=body.rank,password_hash=pwd.hash(secrets.token_urlsafe(32)),department_id=body.department_id,active=False,email_verified=False,activation_required=True)
+    s.add(account); s.flush(); s.add(StationMembership(station_id=station.id,user_id=account.id,assignment_role="Member"))
+    s.add(ActivationToken(user_id=account.id,station_id=station.id,token_hash=hashlib.sha256(raw.encode()).hexdigest(),expires_at=now+timedelta(hours=24)))
+    audit(s,u,"Provisioned activation","user",account.id,"station="+str(station.id)+"; rank="+body.rank); s.commit()
+    send_activation(account.email,raw)
+    return {"status":"activation_sent","user_id":account.id,"station_id":station.id,"expires_in_hours":24}
+
+@app.post("/auth/activate")
+def activate(body:ActivationIn,s:Session=Depends(db)):
+    token_hash=hashlib.sha256(body.token.encode()).hexdigest(); row=s.scalar(select(ActivationToken).where(ActivationToken.token_hash==token_hash,ActivationToken.used.is_(False)))
+    if not row or utc_now(row.expires_at)<datetime.now(timezone.utc): raise HTTPException(400,"Invalid or expired activation token")
+    user=s.get(User,row.user_id)
+    if not user or not user.activation_required: raise HTTPException(400,"Invalid activation state")
+    user.password_hash=pwd.hash(body.password); user.active=True; user.email_verified=True; user.activation_required=False; row.used=True; audit(s,user,"Activated account","user",user.id); s.commit()
+    return {"status":"activated","message":"Account activated. Sign in with your new password."}
 
 @app.get("/users")
 def users(u=Depends(allow("Admin")),s:Session=Depends(db)): return [user_dict(x) for x in s.scalars(select(User).order_by(User.name)).all()]
