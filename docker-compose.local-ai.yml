@@ -1,0 +1,44 @@
+# Optional local AI overlay for PRAGATI-AI.
+# Run with:
+# docker compose -f docker-compose.yml -f docker-compose.local-ai.yml up --build -d
+#
+# This runs Qwen2.5 7B through Ollama in a separate container. The model download
+# is several GB and first startup can take time. The default setup remains unchanged.
+
+services:
+  api:
+    environment:
+      AI_BASE_URL: http://host.docker.internal:11434/v1
+      AI_MODEL: qwen2.5:7b
+      NVIDIA_API_KEY: ""
+    depends_on:
+      ollama-init:
+        condition: service_completed_successfully
+
+  ollama:
+    image: ollama/ollama:latest
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama_data:/root/.ollama
+    healthcheck:
+      test: ["CMD", "ollama", "list"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+
+  ollama-init:
+    image: ollama/ollama:latest
+    environment:
+      OLLAMA_HOST: http://ollama:11434
+    depends_on:
+      ollama:
+        condition: service_healthy
+    volumes:
+      - ollama_data:/root/.ollama
+    entrypoint: ["/bin/sh", "-c"]
+    command: ["ollama pull qwen2.5:7b"]
+    restart: "no"
+
+volumes:
+  ollama_data:
