@@ -1,5 +1,6 @@
 """IPMPRS API: authenticated proposal workflow and precedent retrieval."""
-import csv, hashlib, io, os, re
+import csv, hashlib, io, os, re, secrets, smtplib, time
+from email.message import EmailMessage
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -12,7 +13,7 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from jose import JWTError, jwt
 from passlib.context import CryptContext
 from pydantic import BaseModel, Field
-from sqlalchemy import DateTime, ForeignKey, Integer, LargeBinary, Float, String, Text, JSON, create_engine, select, func, text, or_
+from sqlalchemy import DateTime, ForeignKey, Integer, LargeBinary, Float, String, Text, JSON, create_engine, select, func, text, or_, Index
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, relationship, sessionmaker
 
 APP_ENV = os.getenv("APP_ENV", "development").lower()
@@ -26,9 +27,13 @@ SessionLocal = sessionmaker(engine, expire_on_commit=False)
 # PBKDF2 avoids platform-specific bcrypt binary issues while retaining salted password hashes.
 pwd = CryptContext(schemes=["pbkdf2_sha256"], deprecated="auto")
 security = HTTPBearer()
-ROLES = {"Admin", "Submitter", "Reviewer", "Approving Officer", "Implementation Officer", "SI", "Inspector"}
-RANKS = {"SI", "Inspector"}
-STATION_MANAGERS = {"SI", "Inspector"}
+ROLES = {"Admin", "Submitter", "Reviewer", "Approving Officer", "Implementation Officer", "SI", "Inspector", "Constable", "Head Constable", "ASI", "SHO"}
+RANKS = {"Constable", "Head Constable", "ASI", "SI", "Inspector", "SHO"}
+STATION_MANAGERS = {"SI", "Inspector", "SHO"}
+PRIVILEGED_RANKS = {"SI", "Inspector", "SHO"}
+PERMISSIONS = {"view_station_records": RANKS, "upload_case_file": {"ASI", "SI", "Inspector", "SHO"}, "manage_members": STATION_MANAGERS, "cross_station_request": STATION_MANAGERS}
+OTP_TTL_SECONDS = int(os.getenv("OTP_TTL_SECONDS", "300"))
+OTP_MAX_ATTEMPTS = int(os.getenv("OTP_MAX_ATTEMPTS", "5"))
 _embedding_model = None
 try:
     from pgvector.sqlalchemy import Vector
@@ -46,7 +51,9 @@ class StationMembership(Base):
 class CrossStationRequest(Base):
     __tablename__="cross_station_requests"; id: Mapped[int]=mapped_column(primary_key=True); request_reference: Mapped[str]=mapped_column(String(50), unique=True, nullable=False); source_station_id: Mapped[int]=mapped_column(ForeignKey("stations.id"), nullable=False); destination_station_id: Mapped[int]=mapped_column(ForeignKey("stations.id"), nullable=False); requested_by_id: Mapped[int]=mapped_column(ForeignKey("users.id"), nullable=False); responded_by_id: Mapped[Optional[int]]=mapped_column(ForeignKey("users.id"), nullable=True); purpose: Mapped[str]=mapped_column(Text, nullable=False); shared_information: Mapped[Optional[str]]=mapped_column(Text, nullable=True); status: Mapped[str]=mapped_column(String(20), default="Pending", nullable=False); created_at: Mapped[datetime]=mapped_column(DateTime, default=lambda:datetime.now(timezone.utc)); responded_at: Mapped[Optional[datetime]]=mapped_column(DateTime, nullable=True)
 class User(Base):
-    __tablename__="users"; id: Mapped[int]=mapped_column(primary_key=True); name: Mapped[str]=mapped_column(String(120)); email: Mapped[str]=mapped_column(String(180), unique=True); password_hash: Mapped[str]=mapped_column(String(255)); role: Mapped[str]=mapped_column(String(40)); rank: Mapped[Optional[str]]=mapped_column(String(30), nullable=True); department_id: Mapped[Optional[int]]=mapped_column(ForeignKey("departments.id"), nullable=True); active: Mapped[bool]=mapped_column(default=True)
+    __tablename__="users"; id: Mapped[int]=mapped_column(primary_key=True); name: Mapped[str]=mapped_column(String(120)); email: Mapped[str]=mapped_column(String(180), unique=True); password_hash: Mapped[str]=mapped_column(String(255)); role: Mapped[str]=mapped_column(String(40)); rank: Mapped[Optional[str]]=mapped_column(String(30), nullable=True); department_id: Mapped[Optional[int]]=mapped_column(ForeignKey("departments.id"), nullable=True); active: Mapped[bool]=mapped_column(default=True); email_verified: Mapped[bool]=mapped_column(default=False, nullable=False); activation_required: Mapped[bool]=mapped_column(default=True, nullable=False)
+class OTPChallenge(Base):
+    __tablename__="otp_challenges"; id: Mapped[int]=mapped_column(primary_key=True); user_id: Mapped[int]=mapped_column(ForeignKey("users.id"), nullable=False); code_hash: Mapped[str]=mapped_column(String(128), nullable=False); expires_at: Mapped[datetime]=mapped_column(DateTime, nullable=False); attempts: Mapped[int]=mapped_column(Integer, default=0, nullable=False); consumed: Mapped[bool]=mapped_column(default=False, nullable=False); created_at: Mapped[datetime]=mapped_column(DateTime, default=lambda:datetime.now(timezone.utc))
 class Proposal(Base):
     __tablename__="proposals"; id: Mapped[int]=mapped_column(primary_key=True); reference: Mapped[str]=mapped_column(String(40), unique=True); title: Mapped[str]=mapped_column(String(240)); summary: Mapped[str]=mapped_column(Text); category: Mapped[str]=mapped_column(String(80)); priority: Mapped[str]=mapped_column(String(20), default="Medium"); status: Mapped[str]=mapped_column(String(30), default="Draft"); author_id: Mapped[int]=mapped_column(ForeignKey("users.id")); department_id: Mapped[Optional[int]]=mapped_column(ForeignKey("departments.id")); station_id: Mapped[Optional[int]]=mapped_column(ForeignKey("stations.id"), nullable=True); created_at: Mapped[datetime]=mapped_column(DateTime, default=lambda:datetime.now(timezone.utc)); updated_at: Mapped[datetime]=mapped_column(DateTime, default=lambda:datetime.now(timezone.utc)); decision: Mapped[Optional[str]]=mapped_column(Text, nullable=True); observations: Mapped[Optional[str]]=mapped_column(Text, nullable=True); outcome: Mapped[Optional[str]]=mapped_column(Text, nullable=True)
     documents: Mapped[list["Document"]]=relationship(back_populates="proposal", cascade="all, delete-orphan")
@@ -83,6 +90,7 @@ class AuditLog(Base):
     __tablename__="audit_logs"; id: Mapped[int]=mapped_column(primary_key=True); user_id: Mapped[Optional[int]]=mapped_column(ForeignKey("users.id"), nullable=True); action: Mapped[str]=mapped_column(String(120)); entity: Mapped[str]=mapped_column(String(50)); entity_id: Mapped[int]=mapped_column(Integer); details: Mapped[str]=mapped_column(Text, default=""); created_at: Mapped[datetime]=mapped_column(DateTime, default=lambda:datetime.now(timezone.utc))
 
 class Login(BaseModel): email:str; password:str
+class OTPVerify(BaseModel): challenge_id:int; code:str=Field(min_length=6,max_length=6)
 class ProposalIn(BaseModel): title:str=Field(min_length=3,max_length=240); summary:str=Field(min_length=10); category:str; priority:str="Medium"; department_id:Optional[int]=None; station_id:Optional[int]=None
 class ActionIn(BaseModel): action:str; reason:str=Field(min_length=3)
 class ImplementationIn(BaseModel): progress:int=Field(ge=0,le=100); milestone:str; evidence:str=""
@@ -115,6 +123,18 @@ def audit(s, u, action, entity, entity_id, details=""):
     s.add(AuditLog(user_id=u.id if u else None, action=action, entity=entity, entity_id=entity_id, details=details))
 def notify(s, user_id, message): s.add(Notification(user_id=user_id,message=message))
 def token_for(u): return jwt.encode({"sub":str(u.id),"role":u.role,"exp":datetime.now(timezone.utc)+timedelta(hours=8)}, SECRET_KEY, algorithm="HS256")
+def utc_now(value):
+    return value.replace(tzinfo=timezone.utc) if value and value.tzinfo is None else value
+def needs_otp(u): return APP_ENV == "production" and (u.rank in PRIVILEGED_RANKS or u.role in {"Admin", "Inspector", "SI", "SHO"})
+def send_otp(email, code):
+    host=os.getenv("SMTP_HOST")
+    if not host: raise HTTPException(503,"Email OTP delivery is not configured")
+    msg=EmailMessage(); msg["Subject"]="PRAGATI-AI sign-in verification"; msg["From"]=os.getenv("SMTP_FROM", "no-reply@localhost"); msg["To"]=email; msg.set_content("Your verification code expires shortly: "+code)
+    with smtplib.SMTP(host,int(os.getenv("SMTP_PORT","587")),timeout=10) as smtp:
+        if os.getenv("SMTP_STARTTLS","true").lower()=="true": smtp.starttls()
+        user=os.getenv("SMTP_USERNAME"); password=os.getenv("SMTP_PASSWORD")
+        if user: smtp.login(user,password or "")
+        smtp.send_message(msg)
 def current(c:HTTPAuthorizationCredentials=Depends(security), s:Session=Depends(db)):
     try: uid=int(jwt.decode(c.credentials, SECRET_KEY, algorithms=["HS256"])["sub"])
     except (JWTError, ValueError): raise HTTPException(401,"Invalid session")
@@ -127,12 +147,10 @@ def allow(*roles):
         return u
     return check
 def can_access_proposal(s, u, p):
-    if u.role == "Admin": return True
     if not p.station_id or p.station_id not in station_ids_for(s,u): return False
     if u.role != "Submitter": return True
     return p.author_id == u.id or bool(s.scalar(select(Assignment.id).where(Assignment.proposal_id==p.id, Assignment.user_id==u.id)))
 def visible_to(s,u):
-    if u.role == "Admin": return True
     scope=Proposal.station_id.in_(select(StationMembership.station_id).where(StationMembership.user_id==u.id,StationMembership.active.is_(True)))
     if u.role == "Submitter": return scope & ((Proposal.author_id==u.id) | Proposal.id.in_(select(Assignment.proposal_id).where(Assignment.user_id==u.id)) | Proposal.precedent_visible.is_(True))
     return scope
@@ -186,6 +204,12 @@ def store_embedding(s, p):
     if record: record.vector,record.source_hash,record.created_at=vector,digest,datetime.now(timezone.utc)
     else: s.add(ProposalEmbedding(proposal_id=p.id,model="all-MiniLM-L6-v2",vector=vector,source_hash=digest))
     return True
+def valid_file_signature(raw, content_type):
+    if content_type=="application/pdf": return raw.startswith(b"%PDF-")
+    if content_type=="text/plain": return b"\\x00" not in raw[:4096]
+    if content_type=="application/vnd.openxmlformats-officedocument.wordprocessingml.document": return raw[:4]==b"PK\\x03\\x04"
+    signatures={"image/png":b"\\x89PNG\\r\\n\\x1a\\n","image/jpeg":b"\\xff\\xd8\\xff","image/jpg":b"\\xff\\xd8\\xff","image/webp":b"RIFF" ,"image/tiff":(b"II*\\x00",b"MM\\x00*"),"image/bmp":b"BM"}
+    sig=signatures.get(content_type); return any(raw.startswith(v) for v in sig) if isinstance(sig,tuple) else bool(sig and raw.startswith(sig))
 def extract_document_text(raw, content_type):
     """Extract text and OCR image-only pages. Returns (text, status)."""
     ct = (content_type or "").lower().split(";")[0].strip()
@@ -309,8 +333,20 @@ def seed(s):
 @app.post("/auth/login")
 def login(body:Login,s:Session=Depends(db)):
     u=s.scalar(select(User).where(User.email==body.email))
-    if not u or not pwd.verify(body.password,u.password_hash): raise HTTPException(401,"Invalid email or password")
-    return {"token":token_for(u),"user":{"name":u.name,"role":u.role,"email":u.email}}
+    if not u or not pwd.verify(body.password,u.password_hash) or not u.active: raise HTTPException(401,"Invalid email or password")
+    if needs_otp(u):
+        if not u.email_verified: raise HTTPException(403,"Privileged account email is not verified")
+        code=f"{secrets.randbelow(1000000):06d}"; challenge=OTPChallenge(user_id=u.id,code_hash=hashlib.sha256(code.encode()).hexdigest(),expires_at=datetime.now(timezone.utc)+timedelta(seconds=OTP_TTL_SECONDS)); s.add(challenge); s.commit()
+        send_otp(u.email,code)
+        return {"otp_required":True,"challenge_id":challenge.id,"user":{"name":u.name,"role":u.role,"rank":u.rank,"email":u.email}}
+    return {"token":token_for(u),"user":{"name":u.name,"role":u.role,"rank":u.rank,"email":u.email}}
+@app.post("/auth/verify-otp")
+def verify_otp(body:OTPVerify,s:Session=Depends(db)):
+    c=s.get(OTPChallenge,body.challenge_id); now=datetime.now(timezone.utc); expires=utc_now(c.expires_at) if c else now
+    if not c or c.consumed or expires<now or c.attempts>=OTP_MAX_ATTEMPTS: raise HTTPException(401,"Invalid or expired verification code")
+    c.attempts+=1
+    if not secrets.compare_digest(c.code_hash,hashlib.sha256(body.code.encode()).hexdigest()): s.commit(); raise HTTPException(401,"Invalid or expired verification code")
+    c.consumed=True; u=s.get(User,c.user_id); s.commit(); return {"token":token_for(u),"user":{"name":u.name,"role":u.role,"rank":u.rank,"email":u.email}}
 @app.get("/auth/me")
 def me(u=Depends(current)): return {"id":u.id,"name":u.name,"email":u.email,"role":u.role}
 @app.get("/dashboard")
@@ -607,6 +643,8 @@ def upload(pid:int,file:UploadFile=File(...),document_type:str=Form("Case File")
     }
     if extension not in allowed or content_type not in allowed[extension]:
         raise HTTPException(415,"Allowed types: PDF, DOCX, TXT, JPG/JPEG, PNG, WEBP, TIFF and BMP. Filename extension and MIME type must match.")
+    if APP_ENV == "production" and not valid_file_signature(file.file.read(64), content_type): raise HTTPException(415,"File signature does not match the declared type")
+    file.file.seek(0)
     if document_type not in {"Case File","Supporting Document","Photo/Scan","Evidence Attachment"}: raise HTTPException(422,"Unknown document type.")
     p=s.get(Proposal,pid)
     if not p: raise HTTPException(404,"Proposal not found")
@@ -659,7 +697,9 @@ def read_notification(nid:int,u=Depends(current),s:Session=Depends(db)):
     n.read=True;s.commit();return {"ok":True}
 @app.get("/stations")
 def stations(u=Depends(current),s:Session=Depends(db)):
-    rows=s.scalars(select(Station).where(Station.active.is_(True)).order_by(Station.region,Station.name)).all()
+    query=select(Station).where(Station.active.is_(True)).order_by(Station.region,Station.name)
+    if u.role != "Admin": query=query.where(Station.id.in_(station_ids_for(s,u)))
+    rows=s.scalars(query).all()
     return [station_dict(x,active_member_count(s,x.id)) for x in rows]
 @app.post("/stations")
 def create_station(body:StationIn,u=Depends(allow("Admin")),s:Session=Depends(db)):
